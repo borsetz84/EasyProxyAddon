@@ -91,52 +91,15 @@ if MPD_MODE == "legacy":
 
 logger = logging.getLogger(__name__)
 
-# Sportsonline host variants (including frequent typos)
-_SPORTSONLINE_EXACT_LABELS = {
-    "sportzsonline",
-    "sportzonline",
-    "sportsonline",
-    "sprtsonline",
-    "sportsnline",
-}
-_SPORTSONLINE_FALLBACK_LABEL_RE = re.compile(r"sp(?:o)?rt(?:s|z)?s?(?:o)?nline")
-
-
-def _iter_normalized_hostname_labels(value: str) -> list[str]:
-    if not value:
-        return []
-
-    raw_value = value.strip().lower()
-    parsed = urlparse(raw_value)
-    hostname = parsed.hostname
-
-    # Handle inputs like "sportzsonline.click" without scheme.
-    if not hostname and "://" not in raw_value:
-        hostname = urlparse(f"//{raw_value}").hostname
-
-    if not hostname:
-        hostname = raw_value
-
-    labels = []
-    for label in hostname.split("."):
-        normalized = re.sub(r"[^a-z]", "", label)
-        if normalized:
-            labels.append(normalized)
-
-    return labels
+_SPORTSONLINE_PATH_PATTERNS = (
+    re.compile(r"/channels/[a-z0-9_-]+/[a-z0-9_-]+\.php(?:$|[?#])", re.IGNORECASE),
+    re.compile(r"/hd/hd\d+\.php(?:$|[?#])", re.IGNORECASE),
+)
 
 
 def _is_sportsonline_candidate(value: str) -> bool:
-    for label in _iter_normalized_hostname_labels(value):
-        if label in _SPORTSONLINE_EXACT_LABELS:
-            return True
-        if (
-            label.startswith("sp")
-            and (label.endswith("online") or label.endswith("nline"))
-            and _SPORTSONLINE_FALLBACK_LABEL_RE.fullmatch(label)
-        ):
-            return True
-    return False
+    raw_value = (value or "").strip().lower()
+    return any(pattern.search(raw_value) for pattern in _SPORTSONLINE_PATH_PATTERNS)
 
 
 def _resolve_sportsonline_proxy(url: str) -> str | None:
