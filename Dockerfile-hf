@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # CLONA il repository. Questo comando scarica TUTTI i file, incluso requirements.txt.
-RUN git clone https://github.com/stremio-manager/EasyProxy . 
+RUN git clone https://github.com/borsetz84/EasyProxyAddon . 
 
 # Installa le dipendenze Python.
 RUN pip install --no-cache-dir -r requirements.txt
