@@ -6,8 +6,8 @@ from urllib.parse import urlparse, urljoin
 import aiohttp
 from curl_cffi.requests import AsyncSession
 
-# Adattamento per EasyProxy
 from config import BYPARR_URL, BYPARR_TIMEOUT, get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES
+from utils.cookie_cache import CookieCache
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ class DoodStreamExtractor:
         self.base_headers["User-Agent"] = _DOOD_UA
         self.proxies = proxies or []
         self.mediaflow_endpoint = "proxy_stream_endpoint"
+        self.cache = CookieCache("dood")
 
     def _get_proxy(self, url: str) -> str | None:
         return get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
@@ -45,6 +46,15 @@ class DoodStreamExtractor:
         video_id = parsed.path.rstrip("/").split("/")[-1]
         if not video_id:
             raise ExtractorError("Invalid DoodStream URL: no video ID found")
+
+        domain = parsed.netloc
+        cached = self.cache.get(domain)
+        if cached:
+            logger.info(f"DoodStream: Using cached cookies for {domain}")
+            try:
+                return await self._extract_via_curl_cffi(url, video_id, cookies=cached["cookies"], ua=cached["userAgent"])
+            except Exception as e:
+                logger.warning(f"DoodStream: Cached cookies failed for {domain}: {e}")
 
         if settings.byparr_url:
             try:
@@ -90,6 +100,9 @@ class DoodStreamExtractor:
             ua = solution.get("userAgent", _DOOD_UA)
 
             if cookies:
+                # Salva in cache prima di provare
+                self.cache.set(urlparse(url).netloc, cookies, ua)
+                
                 cf_domain = (
                     next((c.get("domain", "").lstrip(".") for c in raw_cookies if c.get("name") == "cf_clearance"), None)
                     or "playmogo.com"
@@ -110,17 +123,26 @@ class DoodStreamExtractor:
 
             if "pass_md5" not in html:
                 return await self._extract_via_curl_cffi(embed_url, video_id)
+        else:
+            # Abbiamo già l'HTML buono, salviamo comunque i cookie se presenti
+            raw_cookies = solution.get("cookies", [])
+            if raw_cookies:
+                cookies = {c["name"]: c["value"] for c in raw_cookies}
+                ua = solution.get("userAgent", _DOOD_UA)
+                self.cache.set(urlparse(url).netloc, cookies, ua)
 
         # Passiamo l'UA risolto per mantenerlo nella chiamata finale
         return await self._parse_embed_html(html, base_url, ua if 'ua' in locals() else _DOOD_UA)
 
-    async def _extract_via_curl_cffi(self, url: str, video_id: str) -> dict:
+    async def _extract_via_curl_cffi(self, url: str, video_id: str, cookies: dict = None, ua: str = None) -> dict:
         proxy = self._get_proxy(url)
+        current_ua = ua or _DOOD_UA
         async with AsyncSession() as s:
             r = await s.get(
                 url,
                 impersonate="chrome",
-                headers={"Referer": f"https://{urlparse(url).netloc}/", "User-Agent": _DOOD_UA},
+                headers={"Referer": f"https://{urlparse(url).netloc}/", "User-Agent": current_ua},
+                cookies=cookies or {},
                 timeout=30,
                 allow_redirects=True,
                 **({"proxy": proxy} if proxy else {}),
@@ -133,7 +155,7 @@ class DoodStreamExtractor:
                 raise ExtractorError("DoodStream: site is serving a Turnstile CAPTCHA.")
             raise ExtractorError(f"DoodStream: pass_md5 not found in embed HTML")
 
-        return await self._parse_embed_html(html, base_url, _DOOD_UA)
+        return await self._parse_embed_html(html, base_url, current_ua)
 
     async def _parse_embed_html(self, html: str, base_url: str, override_ua: str = None) -> dict:
         pass_match = re.search(r"(/pass_md5/[^'\"<>\s]+)", html)
