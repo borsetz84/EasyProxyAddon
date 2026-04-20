@@ -2509,6 +2509,16 @@ class HLSProxy:
                             
                             resp_ctx = MockSRResp(sr_result["html"])
                             goto_manifest_processing = True
+
+                            # ✅ CRITICAL: Aggiorna la sessione con i cookie freschi sbloccati
+                            # Questo permetterà ai segmenti .ts successivi di funzionare!
+                            if hls_sid and hls_sid in self.header_sessions and sr_result.get("cookies"):
+                                try:
+                                    fresh_cookies_str = "; ".join([f"{k}={v}" for k, v in sr_result["cookies"].items()])
+                                    self.header_sessions[hls_sid]["Cookie"] = fresh_cookies_str
+                                    logger.info(f"🔄 [Cookie Sync] Session {hls_sid} updated with fresh cookies from fallback")
+                                except Exception as ce:
+                                    logger.error(f"❌ Failed to sync cookies: {ce}")
                         else:
                             # Fallback failed too, use original curl_resp
                             resp_ctx = MockResp(curl_resp)
