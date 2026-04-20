@@ -344,6 +344,14 @@ class HLSProxy:
         self.session = None
         self.flex_session = None
 
+        # Registry for HLS header sessions to avoid manifest bloat
+        # sid -> headers_dict
+        self.hls_header_sessions = {}
+        
+        # Registry for HLS URL shortening (to handle extremely long multi-path URLs)
+        # url_id -> actual_url
+        self.hls_url_map = {}
+        
         # Cache for proxy sessions (proxy_url -> session)
         # This reuses connections for the same proxy to improve performance
         self.proxy_sessions = {}
@@ -355,6 +363,15 @@ class HLSProxy:
 
         # Version information
         self.latest_version = "Checking..."
+
+    async def shorten_hls_url(self, url: str) -> str:
+        """Crea un ID breve per un URL e lo memorizza nella mappa."""
+        if not url:
+            return ""
+        # Usa un hash corto (12 caratteri) per l'URL
+        url_id = f"u_{hashlib.md5(url.encode()).hexdigest()[:12]}"
+        self.hls_url_map[url_id] = url
+        return url_id
 
     async def start_tasks(self):
         """Starts background tasks for the proxy."""
@@ -1219,6 +1236,13 @@ class HLSProxy:
         extractor = None
         try:
             target_url = request.query.get("url") or request.query.get("d")
+            
+            # --- Gestione URL brevi (Shortened URLs) ---
+            url_id = request.query.get("hls_url_id")
+            if url_id and url_id in self.hls_url_map:
+                target_url = self.hls_url_map[url_id]
+                logger.info(f"🔗 Resolved short URL ID: {url_id}")
+
             force_refresh = request.query.get("force", "false").lower() == "true"
             redirect_stream = (
                 request.query.get("redirect_stream", "true").lower() == "true"
@@ -1232,20 +1256,20 @@ class HLSProxy:
             # (for example Firebase Storage object paths using `%2F`) would be
             # corrupted and upstream would respond with HTTP 400.
 
-            # ✅ FIX: Extract h_ headers from query params BEFORE calling get_extractor
-            # This ensures GenericHLSExtractor receives the correct Referer/Origin from h_ params
-            # instead of generating them based on the segment's domain.
-            combined_headers = dict(request.headers)
+            # --- GESTIONE HEADER ---
+            combined_headers = {}
+            
+            # 0. Gestione hls_sid (Header Session ID) per ridurre bloat del manifest
+            hls_sid = request.query.get("hls_sid")
+            if hls_sid and hls_sid in self.hls_header_sessions:
+                logger.info(f"📁 Using HLS header session: {hls_sid}")
+                combined_headers.update(self.hls_header_sessions[hls_sid])
+
+            # 1. Header passati come h_X=Y
             for param_name, param_value in request.query.items():
                 if param_name.startswith("h_"):
                     header_name = param_name[2:]
-                    
-                    # ✅ FIX: Rimuovi eventuali header duplicati (case-insensitive)
-                    # Es. se arriva h_Referer, rimuovi sia 'Referer' che 'referer' già presenti
-                    keys_to_remove = [k for k in combined_headers.keys() if k.lower() == header_name.lower()]
-                    for k in keys_to_remove:
-                        del combined_headers[k]
-                    
+                    # Se l'header esiste gia (magari caricato da hls_sid), lo sovrascriviamo se diverso
                     combined_headers[header_name] = param_value
 
 
@@ -1344,15 +1368,25 @@ class HLSProxy:
                 original_channel_url = request.query.get("url") or request.query.get("d", "")
                 api_password = request.query.get("api_password")
                 no_bypass = request.query.get("no_bypass") == "1"
+                # ✅ FIX: Genera un hls_sid se abbiamo header e non ne abbiamo uno
+                # Questo riduce drasticamente la dimensione del manifest rimpiazzando h_header=value con hls_sid=ID
+                current_hls_sid = request.query.get("hls_sid")
+                if not current_hls_sid and stream_headers:
+                    current_hls_sid = f"sid_{int(time.time())}_{random.getrandbits(16)}"
+                    self.hls_header_sessions[current_hls_sid] = stream_headers
+                    logger.info(f"🆕 Created HLS header session: {current_hls_sid}")
+
                 rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
-                    captured_manifest,
-                    stream_url,
-                    proxy_base,
-                    stream_headers,
-                    original_channel_url,
-                    api_password,
-                    self.get_extractor,
-                    no_bypass,
+                    manifest_content=captured_manifest,
+                    base_url=stream_url,
+                    proxy_base=proxy_base,
+                    stream_headers=stream_headers,
+                    original_channel_url=original_channel_url,
+                    api_password=api_password,
+                    get_extractor_func=self.get_extractor,
+                    no_bypass=no_bypass,
+                    hls_sid=current_hls_sid,
+                    shorten_url_func=self.shorten_hls_url,
                 )
                 return web.Response(
                     text=rewritten_manifest,
@@ -1833,12 +1867,20 @@ class HLSProxy:
                 endpoint = "/proxy/mpd/manifest.m3u8"
 
             encoded_url = urllib.parse.quote(stream_url, safe="")
-            header_params = "".join(
-                [
-                    f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}"
-                    for key, value in stream_headers.items()
-                ]
-            )
+            # ✅ FIX: Usa hls_sid anche qui se è un manifest HLS per ridurre la dimensione del primo redirect
+            hls_sid = None
+            if endpoint == "/proxy/hls/manifest.m3u8" and stream_headers:
+                hls_sid = f"sid_{int(time.time())}_{random.getrandbits(16)}"
+                self.hls_header_sessions[hls_sid] = stream_headers
+                logger.info(f"🆕 Created HLS header session in extractor: {hls_sid}")
+                header_params = f"&hls_sid={hls_sid}"
+            else:
+                header_params = "".join(
+                    [
+                        f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}"
+                        for key, value in stream_headers.items()
+                    ]
+                )
 
             # Aggiungi api_password se presente
             api_password = request.query.get("api_password")
@@ -1854,6 +1896,8 @@ class HLSProxy:
 
             # 2. URL PULITO (Per il JSON stile MediaFlow)
             q_params = {}
+            if hls_sid:
+                q_params["hls_sid"] = hls_sid
             if api_password:
                 q_params["api_password"] = api_password
 
@@ -2467,10 +2511,24 @@ class HLSProxy:
                     proxy_base = f"{scheme}://{host}"
                     original_url = request.query.get("url") or request.query.get("d", "")
                     
+                    # ✅ FIX: Genera un hls_sid se non ne abbiamo uno per ridurre la dimensione del manifest
+                    current_hls_sid = request.query.get("hls_sid")
+                    if not current_hls_sid and headers:
+                        current_hls_sid = f"sid_{int(time.time())}_{random.getrandbits(16)}"
+                        self.hls_header_sessions[current_hls_sid] = headers
+                        logger.info(f"🆕 Created HLS header session in proxy: {current_hls_sid}")
+
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
-                        manifest_content, str(resp.url), proxy_base, headers,
-                        original_url, request.query.get("api_password"),
-                        self.get_extractor, request.query.get("no_bypass") == "1"
+                        manifest_content=manifest_content,
+                        base_url=str(resp.url),
+                        proxy_base=proxy_base,
+                        stream_headers=headers,
+                        original_channel_url=original_url,
+                        api_password=request.query.get("api_password"),
+                        get_extractor_func=self.get_extractor,
+                        no_bypass=request.query.get("no_bypass") == "1",
+                        hls_sid=current_hls_sid,
+                        shorten_url_func=self.shorten_hls_url
                     )
                     return web.Response(text=rewritten, headers={
                         "Content-Type": "application/vnd.apple.mpegurl",
