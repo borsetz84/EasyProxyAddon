@@ -68,7 +68,7 @@ class RecordingDB:
                 ON recordings(url) WHERE status IN ('starting', 'recording')
             """)
 
-            logger.info(f"Recording database initialized at {self.db_path}")
+            logger.debug(f"Recording database initialized at {self.db_path}")
 
     def create_starting_entry(self, recording_id: str, name: str, url: str) -> bool:
         """Create a 'starting' entry to claim the lock before extraction.
@@ -85,11 +85,11 @@ class RecordingDB:
                     INSERT INTO recordings (id, name, url, status, started_at)
                     VALUES (?, ?, ?, 'starting', ?)
                 """, (recording_id, name, url, started_at))
-            logger.info(f"Created starting entry: {recording_id} for URL: {url[:80]}...")
+            logger.debug(f"Created starting entry: {recording_id} for URL: {url[:80]}...")
             return True
         except sqlite3.IntegrityError as e:
             # Unique constraint violation - another recording for this URL exists
-            logger.info(f"Duplicate recording attempt for URL: {url[:80]}... - {e}")
+            logger.debug(f"Duplicate recording attempt for URL: {url[:80]}... - {e}")
             return False
 
     def update_to_recording(self, recording_id: str, file_path: str,
@@ -184,7 +184,7 @@ class RecordingDB:
                           (recording_id,))
             deleted = cursor.rowcount > 0
             if deleted:
-                logger.info(f"Deleted recording entry: {recording_id}")
+                logger.debug(f"Deleted recording entry: {recording_id}")
             return deleted
 
     def get_old_recordings(self, days: int) -> List[Dict[str, Any]]:

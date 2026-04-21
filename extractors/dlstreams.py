@@ -28,7 +28,7 @@ class DLStreamsExtractor:
         # We intentionally avoid hardcoding CDN domains because they rotate frequently.
         self.stream_origin = self.entry_origin
         self.base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         }
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
@@ -177,10 +177,10 @@ class DLStreamsExtractor:
         channel_key = f"premium{channel_id}"
         player_url = self._build_player_urls(channel_id)[0]
         if self._is_browser_cooldown_active(channel_key):
-            logger.info("DLStreams browser key fetch skipped during cooldown for %s", channel_key)
+            logger.debug("DLStreams browser key fetch skipped during cooldown for %s", channel_key)
             return None
 
-        logger.info("DLStreams browser key fetch starting for %s", key_url)
+        logger.debug("DLStreams browser key fetch starting for %s", key_url)
         try:
             browser = await self._get_browser()
             context = await browser.new_context(
@@ -220,7 +220,7 @@ class DLStreamsExtractor:
                 if key_bytes:
                     self._browser_key_cache[key_url] = key_bytes
                     self._clear_browser_failure(channel_key)
-                    logger.info("DLStreams browser key fetch succeeded for %s", key_url)
+                    logger.debug("DLStreams browser key fetch succeeded for %s", key_url)
                     return key_bytes
                 self._clear_channel_cache(channel_id)
             finally:
@@ -270,7 +270,7 @@ class DLStreamsExtractor:
     async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None) -> str | None:
         channel_key = f"premium{channel_id}"
         if self._is_browser_cooldown_active(channel_key):
-            logger.info("DLStreams browser session capture skipped during cooldown for %s", channel_key)
+            logger.debug("DLStreams browser session capture skipped during cooldown for %s", channel_key)
             return None
 
         lock = self._get_browser_lock(channel_key)
@@ -279,7 +279,7 @@ class DLStreamsExtractor:
                 return None
 
             resolved_player_url = player_url or self._build_player_urls(channel_id)[0]
-            logger.info("DLStreams browser session capture starting for %s", channel_key)
+            logger.debug("DLStreams browser session capture starting for %s", channel_key)
             try:
                 browser = await self._get_browser()
                 context = await browser.new_context(
@@ -355,14 +355,14 @@ class DLStreamsExtractor:
                                     min_expiry_remaining = remaining
                                     found_expiring_cookie = True
                             
-                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Expires in: {remaining/3600:.2f} hours")
+                            logger.debug(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Expires in: {remaining/3600:.2f} hours")
                         else:
-                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Session cookie")
+                            logger.debug(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Session cookie")
 
                     # Calculate adaptive interval: 80% of shortest lifespan, capped between 2m and 1h
                     adaptive_interval = max(120, min(3600, min_expiry_remaining * 0.8))
                     self._dynamic_refresh_interval[channel_key] = adaptive_interval
-                    logger.info(f"🔄 Dynamic refresh interval for {channel_key} set to {adaptive_interval/60:.2f} minutes")
+                    logger.debug(f"🔄 Dynamic refresh interval for {channel_key} set to {adaptive_interval/60:.2f} minutes")
 
                     # Sync cookies to session
                     if self.session:
@@ -370,7 +370,7 @@ class DLStreamsExtractor:
                         for cookie in self._captured_cookies:
                             self.session.cookie_jar.update_cookies({cookie['name']: cookie['value']}, response_url=yarl_url)
 
-                    logger.info("DLStreams browser session capture completed for %s", channel_key)
+                    logger.debug("DLStreams browser session capture completed for %s", channel_key)
                     self._last_session_refresh[channel_key] = time.time()
                     return manifest_text
                 finally:
@@ -460,7 +460,7 @@ class DLStreamsExtractor:
             
             if last_refresh > 0 and (time.time() - last_refresh > refresh_threshold):
                 if channel_key not in self._refresh_tasks or self._refresh_tasks[channel_key].done():
-                    logger.info("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
+                    logger.debug("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
                                 channel_key, refresh_threshold / 60)
                     # We use a wrapper to ensure the task is cleaned up
                     async def do_refresh():
@@ -502,7 +502,7 @@ class DLStreamsExtractor:
 
             # 2. SERVER LOOKUP: refresh once more after possible browser re-capture
             server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
-            logger.info(f"Found server_key: {server_key} via {iframe_origin}")
+            logger.debug(f"Found server_key: {server_key} via {iframe_origin}")
 
             # 2. Construct M3U8 URL
             m3u8_url = f"{lookup_base}/proxy/{server_key}/{channel_key}/mono.css"

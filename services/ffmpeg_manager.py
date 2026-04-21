@@ -65,7 +65,8 @@ class FFmpegManager:
                      logger.warning(f"Stream {stream_id} timed out initializing. Restarting.")
                      try:
                         proc.kill()
-                     except: pass
+                     except Exception:
+                        pass
                      del self.processes[stream_id]
 
             else:
@@ -133,21 +134,21 @@ class FFmpegManager:
                     cmd.extend(["-cenc_decryption_key", key])
                 
                 if keys_to_use:
-                    logger.info(f"Added {len(keys_to_use)} decryption key(s) to FFmpeg command")
+                    logger.debug(f"Added {len(keys_to_use)} decryption key(s) to FFmpeg command")
             except Exception as e:
                 logger.error(f"Error parsing clearkey: {e}")
 
         cmd.extend([
             "-i", url,
-            # --- 720p TRANSCODE for low CPU usage ---
+            # --- 1080p TRANSCODE for high quality ---
             "-threads", "0",  # Use all CPU cores
-            "-vf", "scale=-2:720",  # Scale to 720p max height, keep aspect ratio
+            "-vf", "scale=-2:1080",  # Scale to 1080p max height, keep aspect ratio
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
-            "-crf", "28",
-            "-g", "30",
-            "-profile:v", "baseline",
+            "-crf", "24",
+            "-g", "60",
+            "-profile:v", "main",
             # --- AUDIO ---
             "-c:a", "aac",
             "-b:a", "96k",
@@ -165,8 +166,9 @@ class FFmpegManager:
             playlist_path
         ])
         
-        logger.info(f"Starting FFmpeg for {stream_id} with key: {clearkey}")
-        logger.info(f"Command: {cmd}")
+        logger.info(f"Starting FFmpeg for {stream_id}")
+        logger.debug(f"FFmpeg ClearKey for {stream_id}: {clearkey}")
+        logger.debug(f"FFmpeg command for {stream_id}: {cmd}")
         
         log_file = open(os.path.join(stream_dir, "ffmpeg.log"), "w")
         log_file.write(f"Command: {cmd}\n\n")
@@ -203,7 +205,8 @@ class FFmpegManager:
                  # Kill process?
                  try:
                      process.terminate()
-                 except: pass
+                 except Exception:
+                    pass
                  return None
                 
             return f"{stream_id}/index.m3u8"

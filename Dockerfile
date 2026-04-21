@@ -1,12 +1,12 @@
-# Fase 1: Build
-# Usa un'immagine Python con base Debian per FFmpeg completo
-FROM python:3.11-bookworm
+# Dockerfile.light - Versione leggera senza FlareSolverr/Byparr integrati
+# Ideale per uso con Docker Compose o solver esterni.
+
+FROM python:3.12-slim-bookworm
 
 # Imposta la directory di lavoro all'interno del container.
 WORKDIR /app
 
-# Copia il file delle dipendenze.
-# Farlo prima del resto del codice sfrutta la cache di Docker se le dipendenze non cambiano.
+# Copia il file delle dipendenze per sfruttare la cache.
 COPY requirements.txt .
 
 # Runtime flags for browser-assisted extractors in containers.
@@ -14,10 +14,12 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 ENV PYTHONUNBUFFERED=1
 
-# Installa FFmpeg e le dipendenze necessarie a Chromium/Xvfb.
-RUN apt-get update && apt-get install -y \
+# Installa FFmpeg e Chromium di sistema (importante per molti extractor).
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     xvfb \
+    xauth \
+    chromium \
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -48,15 +50,12 @@ RUN python -m playwright install chromium
 # Copia il resto del codice dell'applicazione nella directory di lavoro.
 COPY . .
 
-# Metadata dell'immagine OCI (Open Container Initiative) corretti.
-LABEL org.opencontainers.image.title="HLS Proxy Server"
-LABEL org.opencontainers.image.description="Server proxy universale per stream HLS con supporto Vavoo, DLHD e playlist builder"
-LABEL org.opencontainers.image.version="2.5.0"
-LABEL org.opencontainers.image.source="https://github.com/realbestia1/EasyProxy"
+# Metadata dell'immagine
+LABEL org.opencontainers.image.title="HLS Proxy Server (Light)"
+LABEL org.opencontainers.image.description="Server proxy universale per stream HLS. Richiede FlareSolverr/Byparr esterni."
 
-# Esponi la porta su cui l'applicazione è in ascolto.
+# Esponi la porta predefinita
 EXPOSE 7860
 
-# Comando per avviare l'app in produzione con Gunicorn
-# Usa sh -c per permettere l'espansione delle variabili e il fallback dinamico dei worker
+# Comando per avviare l'app
 CMD ["sh", "-c", "WORKERS_COUNT=${WORKERS:-$(nproc 2>/dev/null || echo 1)}; xvfb-run -a --server-args='-screen 0 1366x768x24' gunicorn --bind 0.0.0.0:${PORT:-7860} --workers $WORKERS_COUNT --worker-class aiohttp.worker.GunicornWebWorker --timeout 120 --graceful-timeout 120 app:app"]

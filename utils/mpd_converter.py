@@ -211,7 +211,7 @@ class MPDToHLSConverter:
                     if is_null_key:
                         # Chiave nulla: usa comunque l'endpoint decrypt per il remux a TS
                         # ma aggiungi flag per saltare la decrittazione vera e propria
-                        logger.info(f"🔓 Null key detected - using remux endpoint without decryption")
+                        logger.debug(f"🔓 Null key detected - using remux endpoint without decryption")
                         server_side_decryption = True
                         decryption_params = f"&key={key_hex}&key_id={kid_hex}&skip_decrypt=1"
                     else:
@@ -219,7 +219,7 @@ class MPDToHLSConverter:
                         # Passa chiavi multiple nel formato esistente (comma-separated)
                         decryption_params = f"&key={key_hex}&key_id={kid_hex}"
                         key_count = len(kids)
-                        logger.info(f"🔐 ClearKey enabled - {key_count} key pair(s) for server-side decryption")
+                        logger.debug(f"🔐 ClearKey enabled - {key_count} key pair(s) for server-side decryption")
                 except Exception as e:
                     logger.error(f"Error parsing clearkey_param: {e}")
 
@@ -231,7 +231,7 @@ class MPDToHLSConverter:
                  ext_param = "mp4"
             
             if ext_param == "ts" and not server_side_decryption:
-                 logger.info(f"🔄 Forced TS remux requested (ext=ts)")
+                 logger.debug(f"🔄 Forced TS remux requested (ext=ts)")
                  server_side_decryption = True
                  # Use dummy key/id to satisfy the endpoint requirement, and set skip_decrypt=1
                  decryption_params = "&key=00000000000000000000000000000000&key_id=00000000000000000000000000000000&skip_decrypt=1"

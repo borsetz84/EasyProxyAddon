@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlu
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
+from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class VixSrcExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self._session_lock = asyncio.Lock()
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
         self.is_vixsrc = True
 
     @staticmethod
@@ -79,14 +79,21 @@ class VixSrcExtractor:
                 "Use the original /movie/ or /tv/ URL to refresh tokens."
             )
 
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         """Ottiene una sessione HTTP persistente."""
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
+            
+            # Determina il proxy per l'URL (se fornito)
+            proxy = None
+            if url:
+                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
+            else:
+                proxy = self._get_random_proxy()
+                
             if proxy:
-                logger.info("Using proxy %s for VixSrc session.", proxy)
-                connector = ProxyConnector.from_url(proxy)
+                logger.debug("Using proxy %s for VixSrc session.", proxy)
+                connector = get_connector_for_proxy(proxy)
             else:
                 connector = TCPConnector(
                     limit=0,
@@ -112,7 +119,7 @@ class VixSrcExtractor:
 
         for attempt in range(retries):
             try:
-                session = await self._get_session()
+                session = await self._get_session(url)
                 logger.info("Attempt %s/%s for URL: %s", attempt + 1, retries, url)
 
                 async with session.get(url, headers=final_headers) as response:
@@ -168,6 +175,14 @@ class VixSrcExtractor:
                     await asyncio.sleep(delay)
                 else:
                     raise ExtractorError(f"All {retries} attempts failed for {url}: {str(e)}")
+
+            except aiohttp.ClientResponseError as e:
+                if e.status == 404:
+                    raise ExtractorError(f"VixSrc content not found (404): {url}")
+
+                if attempt == retries - 1:
+                    raise ExtractorError(f"Final HTTP error {e.status} for {url}: {str(e)}")
+                await asyncio.sleep(initial_delay)
 
             except Exception as e:
                 logger.error("Non-network error attempt %s for %s: %s", attempt + 1, url, str(e))
@@ -277,7 +292,7 @@ class VixSrcExtractor:
                 )
                 if "window.canPlayFHD = true" in script_content or "canPlayFHD" in script_content:
                     query_params.append(("h", "1"))
-                query_params.append(("lang", "en"))
+                query_params.append(("lang", "it"))
                 if asn_match and asn_match.group(1):
                     query_params.append(("asn", asn_match.group(1)))
                 return urlunparse(parsed_playlist_url._replace(query=urlencode(query_params)))
@@ -310,7 +325,7 @@ class VixSrcExtractor:
         if "window.canPlayFHD = true" in script_content or "canPlayFHD" in script_content:
             query_params.append(("h", "1"))
 
-        query_params.append(("lang", "en"))
+        query_params.append(("lang", "it"))
         asn_match = re.search(r"['\"]asn['\"]\s*:\s*['\"]([^'\"]*)['\"]", script_content)
         if asn_match and asn_match.group(1):
             query_params.append(("asn", asn_match.group(1)))

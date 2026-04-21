@@ -117,7 +117,7 @@ class RecordingManager:
             key_id, key = clearkey.split(':', 1)
             proxy_params['key_id'] = key_id
             proxy_params['key'] = key
-            logger.info("🔐 MPD Recording with ClearKey decryption enabled")
+            logger.debug("🔐 MPD Recording with ClearKey decryption enabled")
         else:
             logger.warning("⚠️ MPD Recording without ClearKey - content may be encrypted")
 
@@ -132,7 +132,7 @@ class RecordingManager:
             video_url = master_url
             audio_url = None
         else:
-            logger.info(f"Parsed MPD master: video=present, audio={'present' if audio_url else 'embedded'}")
+            logger.debug(f"Parsed MPD master: video=present, audio={'present' if audio_url else 'embedded'}")
 
         return StreamConfig(
             video_url=video_url,
@@ -291,7 +291,7 @@ class RecordingManager:
         if config.audio_url:
             # Dual-input: video from input 0, audio from input 1
             cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
-            logger.info("Using dual-input mode: video + separate audio")
+            logger.debug("Using dual-input mode: video + separate audio")
         else:
             # Single input: video and optional audio from same input
             cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
@@ -431,9 +431,9 @@ class RecordingManager:
                     await asyncio.sleep(2)
                     if self.db.is_pid_running(pid):
                         os.kill(pid, signal.SIGKILL)
-                    logger.info(f"Stopped recording {recording_id} via PID {pid}")
+                    logger.debug(f"Stopped recording {recording_id} via PID {pid}")
                 except ProcessLookupError:
-                    logger.info(f"Process {pid} already terminated")
+                    logger.debug(f"Process {pid} already terminated")
                 except Exception as e:
                     logger.error(f"Error killing process {pid}: {e}")
 
@@ -465,7 +465,7 @@ class RecordingManager:
             stderr_text = stderr.decode() if stderr else ""
 
             if stderr_text:
-                logger.info(f"Recording {recording_id} FFmpeg output: {stderr_text[:1000]}")
+                logger.debug(f"Recording {recording_id} FFmpeg output: {stderr_text[:1000]}")
 
             if process.returncode == 0:
                 logger.info(f"Recording {recording_id} completed successfully")
@@ -503,7 +503,7 @@ class RecordingManager:
         if recording.get('file_path') and os.path.exists(recording['file_path']):
             try:
                 os.remove(recording['file_path'])
-                logger.info(f"Deleted recording file: {recording['file_path']}")
+                logger.debug(f"Deleted recording file: {recording['file_path']}")
             except Exception as e:
                 logger.error(f"Error deleting file: {e}")
 

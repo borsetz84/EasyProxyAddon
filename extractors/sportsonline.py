@@ -11,6 +11,9 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 import zstandard  # Importa la libreria zstandard
 from aiohttp_socks import ProxyConnector
+from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
+
+from utils.smart_request import smart_request
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +68,7 @@ class SportsonlineExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self._session_lock = asyncio.Lock()
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
 
     def _get_random_proxy(self):
         return random.choice(self.proxies) if self.proxies else None
@@ -152,13 +155,20 @@ class SportsonlineExtractor:
             )
         )
 
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
+            
+            # Determina il proxy per l'URL (se fornito)
+            proxy = None
+            if url:
+                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
+            else:
+                proxy = self._get_random_proxy()
+                
             if proxy:
-                logger.info(f"Using proxy {proxy} for Sportsonline session.")
-                connector = ProxyConnector.from_url(proxy)
+                logger.debug(f"Using proxy {proxy} for Sportsonline session.")
+                connector = get_connector_for_proxy(proxy)
             else:
                 connector = TCPConnector(limit=0, limit_per_host=0)
 
@@ -171,37 +181,30 @@ class SportsonlineExtractor:
         return self.session
 
     async def _make_robust_request(
-        self, url: str, headers: dict = None, retries=3, initial_delay=2, timeout=15
+        self, url: str, headers: dict = None, retries=2, initial_delay=1, timeout=15
     ):
+        """Effettua richieste HTTP robuste usando smart_request per gestire Cloudflare."""
         final_headers = headers or self.base_headers
-        request_headers = final_headers.copy()
-        request_headers["Accept-Encoding"] = "gzip, deflate, zstd"
 
         for attempt in range(retries):
             try:
-                session = await self._get_session()
-                logger.info(f"Attempt {attempt + 1}/{retries} for URL: {url}")
-                async with session.get(
-                    url, headers=request_headers, timeout=timeout, auto_decompress=False
-                ) as response:
-                    response.raise_for_status()
-                    content = await self._handle_response_content(response)
-                    # We return both content and the final URL to match user snippet
-                    return content, str(response.url)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"⚠️ Connection error attempt {attempt + 1} for {url}: {str(e)}"
-                )
-                if attempt < retries - 1:
-                    delay = initial_delay * (2**attempt)
-                    await asyncio.sleep(delay)
-                else:
-                    raise ExtractorError(
-                        f"All {retries} attempts failed for {url}: {str(e)}"
-                    )
+                logger.debug(f"Attempt {attempt + 1}/{retries} for URL: {url}")
+                
+                # Usiamo smart_request che gestisce già il bypass Cloudflare
+                html = await smart_request("request.get", url, headers=final_headers, proxies=self.proxies)
+                
+                if not html:
+                    raise ExtractorError(f"SmartRequest returned empty response for {url}")
+                
+                # Restituiamo il contenuto e l'URL finale (mocked)
+                return html, url
+
             except Exception as e:
-                logger.exception(f"Error in _make_robust_request for {url}")
-                raise ExtractorError(f"Error in robust request: {str(e)}")
+                logger.warning(f"⚠️ SmartRequest attempt {attempt + 1} failed for {url}: {str(e)}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(initial_delay)
+                else:
+                    raise ExtractorError(f"All SmartRequest attempts failed for {url}: {str(e)}")
         raise ExtractorError(f"Unable to complete request for {url}")
 
     async def _handle_response_content(self, response: aiohttp.ClientResponse) -> str:
@@ -291,7 +294,7 @@ class SportsonlineExtractor:
             user_agent = self._get_request_header("User-Agent", self.base_headers["User-Agent"])
 
             # Step 1: Fetch main page
-            logger.info(f"Fetching main page: {url}")
+            logger.debug(f"Fetching main page: {url}")
             main_headers = self._build_page_headers()
             if source_referer:
                 main_headers["Referer"] = source_referer
@@ -313,7 +316,7 @@ class SportsonlineExtractor:
 
             if iframe_match:
                 iframe_url = self._normalize_stream_url(iframe_match.group(1), main_url)
-                logger.info(f"Found iframe URL: {iframe_url}")
+                logger.debug(f"Found iframe URL: {iframe_url}")
 
                 candidates = [iframe_url]
                 parsed_iframe = urlparse(iframe_url)
@@ -350,7 +353,7 @@ class SportsonlineExtractor:
             # Step 3: Detect packed blocks
             packed_blocks = self._detect_packed_blocks(iframe_html)
 
-            logger.info(f"Found {len(packed_blocks)} packed blocks")
+            logger.debug(f"Found {len(packed_blocks)} packed blocks")
 
             if not packed_blocks:
                 logger.warning("No packed blocks found, trying direct m3u8 search")
@@ -358,7 +361,7 @@ class SportsonlineExtractor:
                 direct_match = self._extract_m3u8_candidate(iframe_html)
                 if direct_match:
                     m3u8_url = self._normalize_stream_url(direct_match, iframe_url)
-                    logger.info(f"Found direct m3u8 URL: {m3u8_url}")
+                    logger.debug(f"Found direct m3u8 URL: {m3u8_url}")
 
                     return {
                         "destination_url": m3u8_url,
@@ -373,12 +376,12 @@ class SportsonlineExtractor:
             m3u8_url = None
             unpacked_code = None
 
-            logger.info(f"Chosen packed block index: {chosen_idx}")
+            logger.debug(f"Chosen packed block index: {chosen_idx}")
 
             # Try to unpack chosen block
             try:
                 unpacked_code = extract_unpack(packed_blocks[chosen_idx])
-                logger.info(f"Successfully unpacked block {chosen_idx}")
+                logger.debug(f"Successfully unpacked block {chosen_idx}")
             except Exception as e:
                 logger.warning(f"Failed to unpack block {chosen_idx}: {e}")
 
@@ -388,7 +391,7 @@ class SportsonlineExtractor:
 
             # If not found, try all other blocks
             if not m3u8_url:
-                logger.info("m3u8 not found in chosen block, trying all blocks")
+                logger.debug("m3u8 not found in chosen block, trying all blocks")
                 for i, block in enumerate(packed_blocks):
                     if i == chosen_idx:
                         continue
@@ -396,7 +399,7 @@ class SportsonlineExtractor:
                         unpacked_code = extract_unpack(block)
                         m3u8_url = self._extract_m3u8_candidate(unpacked_code)
                         if m3u8_url:
-                            logger.info(f"Found m3u8 in block {i}")
+                            logger.debug(f"Found m3u8 in block {i}")
                             break
                     except Exception as e:
                         logger.debug(f"Failed to process block {i}: {e}")

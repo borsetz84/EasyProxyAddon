@@ -129,7 +129,7 @@ def setup_recording_routes(app, recording_manager):
         success = await recording_manager.delete_recording(recording_id)
 
         if success:
-            logger.info(f"Recording {recording_id} deleted via GET request")
+            logger.debug(f"Recording {recording_id} deleted via GET request")
             # Return a simple message - Stremio will show "playback failed" but recording is deleted
             return web.Response(
                 text="Recording deleted successfully. Close this and refresh the catalog.",
@@ -254,7 +254,7 @@ def setup_recording_routes(app, recording_manager):
         )
         await response.prepare(request)
 
-        logger.info(f"Starting live stream of active recording {recording_id}")
+        logger.debug(f"Starting live stream of active recording {recording_id}")
 
         try:
             with open(file_path, 'rb') as f:
@@ -266,12 +266,12 @@ def setup_recording_routes(app, recording_manager):
                         # Check if recording is still active
                         rec = recording_manager.get_recording(recording_id)
                         if not rec or not rec.get('is_active'):
-                            logger.info(f"Recording {recording_id} finished, ending stream")
+                            logger.debug(f"Recording {recording_id} finished, ending stream")
                             break
                         # Wait for more data from FFmpeg
                         await asyncio.sleep(0.5)
         except ConnectionResetError:
-            logger.info(f"Client disconnected from recording {recording_id} stream")
+            logger.debug(f"Client disconnected from recording {recording_id} stream")
         except Exception as e:
             logger.warning(f"Error streaming recording {recording_id}: {e}")
 
@@ -338,7 +338,7 @@ def setup_recording_routes(app, recording_manager):
             pending = recording_manager.get_pending_recording_by_url(url)
             if pending:
                 if pending.get('is_active'):
-                    logger.info(f"Already recording URL: {url}")
+                    logger.debug(f"Already recording URL: {url}")
                 else:
                     # Stuck 'starting' entry - clean it up and try again
                     logger.warning(f"Cleaning up stuck entry for URL: {url}")
@@ -354,7 +354,7 @@ def setup_recording_routes(app, recording_manager):
                         logger.error(f"Failed to start recording after cleanup: {url}")
             # Even if recording failed, still redirect to live stream
             # so user can watch while we figure out what went wrong
-            logger.info(f"Recording may have failed, but redirecting to live stream anyway")
+            logger.debug(f"Recording may have failed, but redirecting to live stream anyway")
 
         # Build proxy URL to watch the live stream while recording
         from urllib.parse import urlencode
@@ -433,4 +433,4 @@ def setup_recording_routes(app, recording_manager):
     app.router.add_get('/api/recordings/{id}/download', handle_download_recording)
     app.router.add_get('/api/recordings/{id}/stream', handle_stream_recording)
 
-    logger.info("Recording routes registered")
+    logger.debug("Recording routes registered")
