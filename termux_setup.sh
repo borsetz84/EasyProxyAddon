@@ -130,6 +130,7 @@ proot-distro login $DISTRO_NAME -- bash -c '
     fi
     cd "$EP_DIR/flaresolverr"
     sed -i "s|options.add_argument('--no-sandbox')|options.add_argument('--no-sandbox'); options.add_argument('--disable-dev-shm-usage'); options.add_argument('--disable-gpu'); options.add_argument('--headless=new')|" src/utils.py 2>/dev/null || true
+    sed -i "s|start_xvfb_display()|# start_xvfb_display()|g" src/utils.py 2>/dev/null || true
     sed -i "s|driver_executable_path=driver_exe_path|driver_executable_path=\"/usr/bin/chromedriver\"|" src/utils.py 2>/dev/null || true
     pip install --no-cache-dir --ignore-installed -r requirements.txt --break-system-packages || true
 
