@@ -191,7 +191,10 @@ class SportsonlineExtractor:
                 logger.debug(f"Attempt {attempt + 1}/{retries} for URL: {url}")
                 
                 # Usiamo smart_request che gestisce già il bypass Cloudflare
-                html = await smart_request("request.get", url, headers=final_headers, proxies=self.proxies)
+                response_data = await smart_request(
+                    "request.get", url, headers=final_headers, proxies=self.proxies
+                )
+                html, _cookies = self._extract_html_and_cookies(response_data)
                 
                 if not html:
                     raise ExtractorError(f"SmartRequest returned empty response for {url}")
@@ -282,6 +285,29 @@ class SportsonlineExtractor:
         if not urlparse(cleaned).scheme:
             return urljoin(base_url, cleaned)
         return cleaned
+
+    @staticmethod
+    def _extract_html_and_cookies(response_data: Any) -> tuple[str, dict[str, str]]:
+        """Normalize SmartRequest responses into an HTML string plus cookies."""
+        if isinstance(response_data, str):
+            return response_data, {}
+
+        if isinstance(response_data, dict):
+            html = response_data.get("html", "")
+            cookies = response_data.get("cookies", {}) or {}
+            if not isinstance(html, str):
+                raise ExtractorError(
+                    f"SmartRequest returned non-string html payload: {type(html).__name__}"
+                )
+            if not isinstance(cookies, dict):
+                cookies = {}
+            return html, {
+                str(name): str(value) for name, value in cookies.items() if value is not None
+            }
+
+        raise ExtractorError(
+            f"SmartRequest returned unsupported payload type: {type(response_data).__name__}"
+        )
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         """Main extraction flow: fetch page, extract iframe, unpack and find m3u8."""

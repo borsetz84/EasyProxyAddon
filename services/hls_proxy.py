@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import random
 import re
 import sys
 import os
+import time
 import socket
 import urllib.parse
 from urllib.parse import urlparse, urljoin
@@ -37,6 +39,7 @@ from config import (
     TRANSPORT_ROUTES,
     get_proxy_for_url,
     get_ssl_setting_for_url,
+    get_connector_for_proxy,
     API_PASSWORD,
     check_password,
     MPD_MODE,
@@ -46,6 +49,8 @@ from config import (
     ENABLE_REMUXING,
     WARP_EXCLUDE_DOMAINS,
     WARP_PROXY_URL,
+    BYPASS_WARP_CONTEXT,
+    SELECTED_PROXY_CONTEXT,
 )
 from extractors.generic import GenericHLSExtractor, ExtractorError
 from services.manifest_rewriter import ManifestRewriter
@@ -122,7 +127,7 @@ def _is_sportsonline_candidate(value: str) -> bool:
     return any(pattern.search(raw_value) for pattern in _SPORTSONLINE_PATH_PATTERNS)
 
 
-def _resolve_sportsonline_proxy(url: str) -> str | None:
+def _resolve_sportsonline_proxy(url: str, bypass_warp: bool = False) -> str | None:
     # Priority requested: real URL first, then legacy aliases.
     ordered_candidates = [url, "sportzsonline", "sportzonline", "sportsonline"]
 
@@ -131,10 +136,10 @@ def _resolve_sportsonline_proxy(url: str) -> str | None:
         if any(
             route.get("url") and route["url"] in candidate for route in TRANSPORT_ROUTES
         ):
-            return get_proxy_for_url(candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES)
+            return get_proxy_for_url(candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
 
     # Fallback to default behavior (global proxy or direct).
-    return get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
+    return get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
 
 
 # Importazione condizionale degli estrattori
@@ -343,8 +348,11 @@ class HLSProxy:
         self.flex_session = None
 
         # Registry for HLS URL shortening (to handle extremely long multi-path URLs)
-        # url_id -> actual_url
+        # url_id -> (actual_url, timestamp, ttl)
         self.hls_url_map = {}
+        self.hls_url_ttl = 3600
+        self.hls_url_ttl_cinemacity = 10800
+        self.hls_url_max_entries = 2000
         
         # Cache for proxy sessions (proxy_url -> session)
         # This reuses connections for the same proxy to improve performance
@@ -362,9 +370,30 @@ class HLSProxy:
         """Crea un ID breve per un URL e lo memorizza nella mappa."""
         if not url:
             return ""
+        now = time.time()
+        current_ttl = (
+            self.hls_url_ttl_cinemacity
+            if "cinemacity.cc" in url.lower() or "cccdn.net" in url.lower()
+            else self.hls_url_ttl
+        )
+        expired_keys = [
+            key for key, (_, ts, ttl) in self.hls_url_map.items()
+            if now - ts > ttl
+        ]
+        for key in expired_keys:
+            self.hls_url_map.pop(key, None)
+
+        if len(self.hls_url_map) >= self.hls_url_max_entries:
+            oldest_keys = sorted(
+                self.hls_url_map.items(),
+                key=lambda item: item[1][1]
+            )[: max(1, len(self.hls_url_map) - self.hls_url_max_entries + 1)]
+            for key, _ in oldest_keys:
+                self.hls_url_map.pop(key, None)
+
         # Usa un hash corto (12 caratteri) per l'URL
         url_id = f"u_{hashlib.md5(url.encode()).hexdigest()[:12]}"
-        self.hls_url_map[url_id] = url
+        self.hls_url_map[url_id] = (url, now, current_ttl)
         return url_id
 
     async def start_tasks(self):
@@ -547,20 +576,22 @@ class HLSProxy:
 
             connector = TCPConnector(**connector_kwargs)
             session = aiohttp.ClientSession(
-                timeout=ClientTimeout(total=30), connector=connector
+                timeout=ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None),
+                connector=connector,
             )
             setattr(self, target_attr, session)
         return session
 
-    def _check_dynamic_warp_bypass(self, url: str):
-        """Dynamically adds domain to WARP bypass if it matches known patterns."""
+    def _check_dynamic_warp_bypass(self, url: str, force: bool = False):
+        """Dynamically adds domain to WARP bypass if it matches known patterns or if forced."""
         if not ENABLE_WARP or VERSION_MODE != "Full":
             return
             
         # Patterns for domains that usually block Cloudflare/WARP
         # Cinemacity, VixSrc, etc.
         bypass_patterns = [
-            "cccdn.net", "cinemacity.cc"
+            "cccdn.net", "cinemacity.cc", "strem.fun", "torrentio.strem.fun",
+            "vavoo.to", "vavoo.tv", "lokke.app"
         ]
         
         try:
@@ -568,8 +599,8 @@ class HLSProxy:
             domain = urlsplit(url).netloc
             if not domain: return
             
-            # If domain matches any pattern and hasn't been bypassed yet
-            is_problematic = any(p in domain.lower() for p in bypass_patterns)
+            # If domain matches any pattern, has been bypassed yet, or if forced
+            is_problematic = force or any(p in domain.lower() for p in bypass_patterns)
 
             if is_problematic:
                 if domain not in BYPASSED_WARP_DOMAINS:
@@ -592,13 +623,7 @@ class HLSProxy:
         except Exception as e:
             logging.error(f"❌ Error in dynamic WARP bypass: {e}")
 
-    async def _get_proxy_session(self, url: str):
-        """Get a session with proxy support for the given URL."""
-        self._check_dynamic_warp_bypass(url)
-        
-        # Debug: Check current egress IP for this domain (optional, slow if enabled)
-        # if any(p in url for p in ["vavoo", "mediahub"]):
-        #    logger.info(f"🔍 Requesting {url} via {'DIRECT' if any(d in url for d in BYPASSED_WARP_DOMAINS) else 'WARP'}")
+    async def _get_proxy_session(self, url: str, bypass_warp: bool = False):
         """Get a session with proxy support for the given URL.
 
         Sessions are cached and reused for the same proxy to improve performance.
@@ -608,9 +633,9 @@ class HLSProxy:
         - proxy_url: The proxy URL being used, or None for direct connection
         """
         # Trigger dynamic bypass check before getting proxy settings
-        self._check_dynamic_warp_bypass(url)
+        self._check_dynamic_warp_bypass(url, force=bypass_warp)
         
-        proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
+        proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
 
         prefer_default_family = "ai.the-sunmoon.site/key/" in url
 
@@ -619,7 +644,7 @@ class HLSProxy:
             if proxy in self.proxy_sessions:
                 cached_session = self.proxy_sessions[proxy]
                 if not cached_session.closed:
-                    logger.debug(f"♻️ Reusing cached proxy session: {proxy}")
+                    # logger.debug(f"♻️ Reusing cached proxy session: {proxy}")
                     return cached_session, proxy  # Reuse cached session
                 else:
                     # Remove closed session from cache
@@ -645,7 +670,7 @@ class HLSProxy:
                     family=socket.AF_INET,  # Force IPv4
                     rdns=rdns,
                 )
-                timeout = ClientTimeout(total=30)
+                timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
                 session = ClientSession(timeout=timeout, connector=connector)
                 self.proxy_sessions[proxy] = session  # Cache the session
                 return session, proxy  # Return proxy URL for logging
@@ -657,6 +682,49 @@ class HLSProxy:
         # Fallback to shared non-proxy session
         session = await self._get_session(prefer_default_family=prefer_default_family)
         return session, None
+
+    async def _retry_cccdn_request(self, request_target, headers, disable_ssl: bool):
+        """Retry cccdn once via an alternate aiohttp route when direct access returns 403."""
+        retry_proxy = None
+        if ENABLE_WARP and WARP_PROXY_URL and "127.0.0.1" not in WARP_PROXY_URL:
+            retry_proxy = WARP_PROXY_URL
+        elif ENABLE_WARP and WARP_PROXY_URL:
+            from config import is_proxy_alive
+            if is_proxy_alive(WARP_PROXY_URL):
+                retry_proxy = WARP_PROXY_URL
+        elif GLOBAL_PROXIES:
+            retry_proxy = GLOBAL_PROXIES[0]
+
+        if not retry_proxy:
+            return None
+
+        try:
+            connector = get_connector_for_proxy(
+                retry_proxy,
+                limit=0,
+                limit_per_host=0,
+                keepalive_timeout=60,
+                family=socket.AF_INET,
+                rdns=True,
+            )
+            timeout = ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=None)
+            async with ClientSession(timeout=timeout, connector=connector) as retry_session:
+                async with retry_session.get(
+                    request_target,
+                    headers=headers,
+                    ssl=not disable_ssl,
+                ) as retry_resp:
+                    if retry_resp.status not in [200, 206]:
+                        return None
+                    return {
+                        "status": retry_resp.status,
+                        "headers": dict(retry_resp.headers),
+                        "body": await retry_resp.read(),
+                        "proxy": retry_proxy,
+                    }
+        except Exception as e:
+            logger.warning("⚠️ cccdn retry via alternate route failed: %r", e)
+            return None
 
     @staticmethod
     def _query_flag_is_true(value: str | None) -> bool:
@@ -678,202 +746,215 @@ class HLSProxy:
 
         return False
 
-    async def get_extractor(self, url: str, request_headers: dict, host: str = None):
+    async def get_extractor(self, url: str, request_headers: dict, host: str = None, bypass_warp: bool = False):
         """Ottiene l'estrattore appropriato per l'URL"""
         try:
             # 1. Selezione Manuale tramite parametro 'host'
             if host:
                 host = host.lower()
-                key = host
+                # ✅ FIX: Usa una chiave di cache che include lo stato del WARP per evitare contaminazioni
+                key = f"{host}_direct" if bypass_warp else host
+                
+                # ✅ FIX: Calcola il proxy corretto in base a bypass_warp invece di usare GLOBAL_PROXIES indiscriminatamente
+                proxy = get_proxy_for_url(host, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
+                proxy_list = [proxy] if proxy else []
 
                 if host == "vavoo":
                     if key not in self.extractors:
                         self.extractors[key] = VavooExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "vixsrc":
                     if key not in self.extractors:
                         self.extractors[key] = VixSrcExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "vixcloud":
                     if key not in self.extractors:
                         self.extractors[key] = VixSrcExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif _is_sportsonline_candidate(host):
-                    key = "sportsonline"
+                    key = "sportsonline_direct" if bypass_warp else "sportsonline"
                     if key not in self.extractors:
                         self.extractors[key] = SportsonlineExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host in {"mixdrop", "m1xdrop"}:
                     if key not in self.extractors:
                         self.extractors[key] = MixdropExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "voe":
                     if key not in self.extractors:
                         self.extractors[key] = VoeExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "streamtape":
                     if key not in self.extractors:
                         self.extractors[key] = StreamtapeExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "orion":
                     if key not in self.extractors:
                         self.extractors[key] = OrionExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "freeshot":
                     if key not in self.extractors:
                         self.extractors[key] = FreeshotExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 # --- New Extractors (host selection) ---
                 elif host in ["doodstream", "dood", "d000d"]:
-                    key = "doodstream"
+                    key = "doodstream_direct" if bypass_warp else "doodstream"
                     if key not in self.extractors:
                         self.extractors[key] = DoodStreamExtractor(
                             request_headers,
-                            proxies=GLOBAL_PROXIES,
+                            proxies=proxy_list,
                         )
                     return self.extractors[key]
                 elif host == "fastream":
                     if key not in self.extractors:
                         self.extractors[key] = FastreamExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "filelions":
                     if key not in self.extractors:
                         self.extractors[key] = FileLionsExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "filemoon":
                     if key not in self.extractors:
                         self.extractors[key] = FileMoonExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "lulustream":
                     if key not in self.extractors:
                         self.extractors[key] = LuluStreamExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "maxstream":
                     if key not in self.extractors:
+                        # Maxstream needs multiple candidates because of mirrors
                         proxy_candidates = []
                         for candidate in ("uprot.net", "maxstream.video", "maxstream"):
-                            proxy = get_proxy_for_url(
-                                candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES
+                            p = get_proxy_for_url(
+                                candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                             )
-                            if proxy and proxy not in proxy_candidates:
-                                proxy_candidates.append(proxy)
+                            if p and p not in proxy_candidates:
+                                proxy_candidates.append(p)
                         self.extractors[key] = MaxstreamExtractor(
                             request_headers, proxies=proxy_candidates
                         )
                     return self.extractors[key]
                 elif host in ["okru", "ok.ru"]:
-                    key = "okru"
+                    key = "okru_direct" if bypass_warp else "okru"
                     if key not in self.extractors:
                         self.extractors[key] = OkruExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "streamwish":
                     if key not in self.extractors:
                         self.extractors[key] = StreamWishExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "deltabit":
                     if key not in self.extractors:
                         self.extractors[key] = DeltabitExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                         )
                     return self.extractors[key]
                 elif host == "streamhg":
                     if key not in self.extractors:
                         self.extractors[key] = StreamHGExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "supervideo":
                     if key not in self.extractors:
                         self.extractors[key] = SupervideoExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "dropload":
                     if key not in self.extractors:
                         self.extractors[key] = DroploadExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "uqload":
                     if key not in self.extractors:
                         self.extractors[key] = UqloadExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "vidmoly":
                     if key not in self.extractors:
                         self.extractors[key] = VidmolyExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host in ["vidoza", "videzz"]:
-                    key = "vidoza"
+                    key = "vidoza_direct" if bypass_warp else "vidoza"
                     if key not in self.extractors:
                         self.extractors[key] = VidozaExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host in ["turbovidplay", "turboviplay", "emturbovid"]:
-                    key = "turbovidplay"
+                    key = "turbovidplay_direct" if bypass_warp else "turbovidplay"
                     if key not in self.extractors:
                         self.extractors[key] = TurboVidPlayExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "livetv":
                     if key not in self.extractors:
                         self.extractors[key] = LiveTVExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
                 elif host == "f16px":
                     if key not in self.extractors:
                         self.extractors[key] = F16PxExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
+                        )
+                    return self.extractors[key]
+                elif host in ["dlhd", "dlstreams"]:
+                    key = "dlstreams_direct" if bypass_warp else "dlstreams"
+                    if key not in self.extractors:
+                        self.extractors[key] = DLStreamsExtractor(
+                            request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                         )
                     return self.extractors[key]
                 elif host in ["city", "cinemacity"]:
-                    key = "cinemacity"
+                    key = "cinemacity_direct" if bypass_warp else "cinemacity"
                     if key not in self.extractors:
                         self.extractors[key] = CinemaCityExtractor(
-                            request_headers, proxies=GLOBAL_PROXIES
+                            request_headers, proxies=proxy_list
                         )
                     return self.extractors[key]
 
             # 2. Auto-detection basata sull'URL
             if "vavoo.to" in url:
-                key = "vavoo"
-                proxy = get_proxy_for_url("vavoo.to", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "vavoo_direct" if bypass_warp else "vavoo"
+                proxy = get_proxy_for_url("vavoo.to", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VavooExtractor(
@@ -883,8 +964,8 @@ class HLSProxy:
             elif "vixsrc.to/" in url.lower() and any(
                 x in url for x in ["/movie/", "/tv/", "/iframe/", "/embed/", "/playlist/"]
             ):
-                key = "vixsrc"
-                proxy = get_proxy_for_url("vixsrc.to", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "vixsrc_direct" if bypass_warp else "vixsrc"
+                proxy = get_proxy_for_url("vixsrc.to", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VixSrcExtractor(
@@ -894,8 +975,8 @@ class HLSProxy:
             elif "vixcloud.co/" in url.lower() and any(
                 x in url.lower() for x in ["/embed/", "/playlist/"]
             ):
-                key = "vixcloud"
-                proxy = get_proxy_for_url("vixcloud.co", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "vixcloud_direct" if bypass_warp else "vixcloud"
+                proxy = get_proxy_for_url("vixcloud.co", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VixSrcExtractor(
@@ -903,7 +984,7 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif _is_sportsonline_candidate(url):
-                key = "sportsonline"
+                key = "sportsonline_direct" if bypass_warp else "sportsonline"
                 proxy = _resolve_sportsonline_proxy(url)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -923,8 +1004,8 @@ class HLSProxy:
                     ]
                 )
             ):
-                key = "streamhg"
-                proxy = get_proxy_for_url("streamhg", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "streamhg_direct" if bypass_warp else "streamhg"
+                proxy = get_proxy_for_url("streamhg", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = StreamHGExtractor(
@@ -932,8 +1013,8 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "cinemacity.cc" in url.lower():
-                key = "cinemacity"
-                proxy = get_proxy_for_url("cinemacity.cc", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "cinemacity_direct" if bypass_warp else "cinemacity"
+                proxy = get_proxy_for_url("cinemacity.cc", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = CinemaCityExtractor(
@@ -941,8 +1022,8 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "mixdrop" in url or "m1xdrop" in url:
-                key = "mixdrop"
-                proxy = get_proxy_for_url("mixdrop", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "mixdrop_direct" if bypass_warp else "mixdrop"
+                proxy = get_proxy_for_url("mixdrop", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = MixdropExtractor(
@@ -960,8 +1041,8 @@ class HLSProxy:
                     "voe-network.net",
                 ]
             ):
-                key = "voe"
-                proxy = get_proxy_for_url("voe.sx", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "voe_direct" if bypass_warp else "voe"
+                proxy = get_proxy_for_url("voe.sx", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VoeExtractor(
@@ -969,11 +1050,12 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "popcdn.day" in url or "freeshot.live" in url:
-                key = "freeshot"
+                key = "freeshot_direct" if bypass_warp else "freeshot"
                 proxy = get_proxy_for_url(
                     "popcdn.day" if "popcdn.day" in url else "freeshot.live", 
                     TRANSPORT_ROUTES, 
-                    GLOBAL_PROXIES
+                    GLOBAL_PROXIES,
+                    bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -986,9 +1068,9 @@ class HLSProxy:
                 or "streamtape.to" in url
                 or "streamtape.net" in url
             ):
-                key = "streamtape"
+                key = "streamtape_direct" if bypass_warp else "streamtape"
                 proxy = get_proxy_for_url(
-                    "streamtape", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "streamtape", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -997,9 +1079,9 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "orionoid.com" in url:
-                key = "orion"
+                key = "orion_direct" if bypass_warp else "orion"
                 proxy = get_proxy_for_url(
-                    "orionoid.com", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "orionoid.com", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1020,9 +1102,9 @@ class HLSProxy:
                     "dood.pm",
                 ]
             ):
-                key = "doodstream"
+                key = "doodstream_direct" if bypass_warp else "doodstream"
                 proxy = get_proxy_for_url(
-                    "doodstream", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "doodstream", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1032,8 +1114,8 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "fastream" in url:
-                key = "fastream"
-                proxy = get_proxy_for_url("fastream", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "fastream_direct" if bypass_warp else "fastream"
+                proxy = get_proxy_for_url("fastream", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = FastreamExtractor(
@@ -1041,8 +1123,8 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "filelions" in url:
-                key = "filelions"
-                proxy = get_proxy_for_url("filelions", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "filelions_direct" if bypass_warp else "filelions"
+                proxy = get_proxy_for_url("filelions", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = FileLionsExtractor(
@@ -1050,8 +1132,8 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "filemoon" in url:
-                key = "filemoon"
-                proxy = get_proxy_for_url("filemoon", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                key = "filemoon_direct" if bypass_warp else "filemoon"
+                proxy = get_proxy_for_url("filemoon", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = FileMoonExtractor(
@@ -1060,24 +1142,24 @@ class HLSProxy:
                 return self.extractors[key]
             elif (
                 # Rileva per dominio noto (aggiorna qui se cambia)
-                "dlhd.dad" in url
+                any(d in url for d in ["dlhd.dad", "dlstreams.com"])
                 # Rileva per pattern URL stabile (/watch.php?id=NNN)
                 or (re.search(r'/watch\.php\?.*id=\d+', url) is not None)
             ):
-                key = "dlstreams"
+                key = "dlstreams_direct" if bypass_warp else "dlstreams"
                 proxy = get_proxy_for_url(
-                    "dlhd.dad", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "dlhd.dad", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = DLStreamsExtractor(
-                        request_headers, proxies=proxy_list
+                        request_headers, proxies=proxy_list, bypass_warp=bypass_warp
                     )
                 return self.extractors[key]
             elif "lulustream" in url:
-                key = "lulustream"
+                key = "lulustream_direct" if bypass_warp else "lulustream"
                 proxy = get_proxy_for_url(
-                    "lulustream", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "lulustream", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1086,11 +1168,11 @@ class HLSProxy:
                     )
                 return self.extractors[key]
             elif "maxstream" in url or "uprot.net" in url:
-                key = "maxstream"
+                key = "maxstream_direct" if bypass_warp else "maxstream"
                 proxy_list = []
                 for candidate in (url, "uprot.net", "maxstream.video", "maxstream"):
                     proxy = get_proxy_for_url(
-                        candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES
+                        candidate, TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                     )
                     if proxy and proxy not in proxy_list:
                         proxy_list.append(proxy)
@@ -1101,7 +1183,7 @@ class HLSProxy:
                 return self.extractors[key]
             elif "ok.ru" in url or "odnoklassniki" in url:
                 key = "okru"
-                proxy = get_proxy_for_url("ok.ru", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy = get_proxy_for_url("ok.ru", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = OkruExtractor(
@@ -1114,7 +1196,7 @@ class HLSProxy:
             ):
                 key = "streamwish"
                 proxy = get_proxy_for_url(
-                    "streamwish", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "streamwish", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1125,7 +1207,7 @@ class HLSProxy:
             elif "supervideo" in url:
                 key = "supervideo"
                 proxy = get_proxy_for_url(
-                    "supervideo", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "supervideo", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1136,7 +1218,7 @@ class HLSProxy:
             elif "dropload" in url:
                 key = "dropload"
                 proxy = get_proxy_for_url(
-                    "dropload", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "dropload", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1150,7 +1232,7 @@ class HLSProxy:
             ):
                 # Only match embed pages (e.g. uqload.is/abc123.html), not CDN video URLs (m80.uqload.is/.../v.mp4)
                 key = "uqload"
-                proxy = get_proxy_for_url("uqload", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy = get_proxy_for_url("uqload", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = UqloadExtractor(
@@ -1159,7 +1241,7 @@ class HLSProxy:
                 return self.extractors[key]
             elif "vidmoly" in url:
                 key = "vidmoly"
-                proxy = get_proxy_for_url("vidmoly", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy = get_proxy_for_url("vidmoly", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VidmolyExtractor(
@@ -1168,7 +1250,7 @@ class HLSProxy:
                 return self.extractors[key]
             elif "vidoza" in url or "videzz" in url:
                 key = "vidoza"
-                proxy = get_proxy_for_url("vidoza", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy = get_proxy_for_url("vidoza", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = VidozaExtractor(
@@ -1188,7 +1270,7 @@ class HLSProxy:
             ):
                 key = "turbovidplay"
                 proxy = get_proxy_for_url(
-                    "turbovidplay", TRANSPORT_ROUTES, GLOBAL_PROXIES
+                    "turbovidplay", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp
                 )
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
@@ -1200,7 +1282,7 @@ class HLSProxy:
                 d in url for d in ["f16px", "embedme", "embedsb", "playersb"]
             ):
                 key = "f16px"
-                proxy = get_proxy_for_url("f16px", TRANSPORT_ROUTES, GLOBAL_PROXIES)
+                proxy = get_proxy_for_url("f16px", TRANSPORT_ROUTES, GLOBAL_PROXIES, bypass_warp=bypass_warp)
                 proxy_list = [proxy] if proxy else []
                 if key not in self.extractors:
                     self.extractors[key] = F16PxExtractor(
@@ -1227,15 +1309,25 @@ class HLSProxy:
             )
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
-        extractor = None
+        target_url = request.query.get("url") or request.query.get("d")
+        bypass_warp = (request.query.get("warp", "").lower() == "off") or (
+            target_url and ("vavoo.to" in target_url or "vavoo.tv" in target_url)
+        )
+        token = BYPASS_WARP_CONTEXT.set(bypass_warp)
+        proxy_token = SELECTED_PROXY_CONTEXT.set(None)
+        
         try:
-            target_url = request.query.get("url") or request.query.get("d")
+            extractor = None
             
             # --- Gestione URL brevi (Shortened URLs) ---
             url_id = request.query.get("hls_url_id")
             if url_id and url_id in self.hls_url_map:
-                target_url = self.hls_url_map[url_id]
-                logger.debug(f"🔗 Resolved short URL ID: {url_id}")
+                target_url, stored_at, entry_ttl = self.hls_url_map[url_id]
+                if time.time() - stored_at <= entry_ttl:
+                    logger.debug(f"🔗 Resolved short URL ID: {url_id}")
+                else:
+                    self.hls_url_map.pop(url_id, None)
+                    target_url = None
 
             force_refresh = request.query.get("force", "false").lower() == "true"
             redirect_stream = (
@@ -1274,11 +1366,12 @@ class HLSProxy:
                         "icy-metadata",
                         "accept-encoding",
                         "content-length",
+                        "x-easyproxy-disable-ssl",
                     }:
                         continue
                     stream_headers[header_name] = header_value
             else:
-                extractor = await self.get_extractor(target_url, combined_headers)
+                extractor = await self.get_extractor(target_url, combined_headers, bypass_warp=bypass_warp)
                 
                 # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
                 # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
@@ -1293,19 +1386,19 @@ class HLSProxy:
                     target_url,
                     force_refresh=force_refresh,
                     request_headers=combined_headers,
+                    bypass_warp=bypass_warp
                 )
+                bypass_warp = result.get("bypass_warp", bypass_warp)
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
                 captured_manifest = result.get("captured_manifest")
-                warp_bypass = result.get("warp_bypass", False)
+                force_disable_ssl = result.get("disable_ssl", False)
 
-                # Se l'estrattore richiede il bypass di WARP, aggiungiamo il flag all'URL
-                if warp_bypass:
+                if force_disable_ssl:
                     if "?" in stream_url:
-                        stream_url += "&direct=1"
+                        stream_url += "&disable_ssl=1"
                     else:
-                        stream_url += "?direct=1"
-                    logger.info(f"⚡ WARP Bypass forced for this stream: {stream_url[:50]}...")
+                        stream_url += "?disable_ssl=1"
 
 
             # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
@@ -1355,6 +1448,10 @@ class HLSProxy:
                 original_channel_url = request.query.get("url") or request.query.get("d", "")
                 api_password = request.query.get("api_password")
                 no_bypass = request.query.get("no_bypass") == "1"
+                use_short_hls_urls = (
+                    "cinemacity.cc" in (original_channel_url or "").lower()
+                    or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                )
                 rewritten_manifest = await ManifestRewriter.rewrite_manifest_urls(
                     manifest_content=captured_manifest,
                     base_url=stream_url,
@@ -1362,9 +1459,10 @@ class HLSProxy:
                     stream_headers=stream_headers,
                     original_channel_url=original_channel_url,
                     api_password=api_password,
-                    get_extractor_func=self.get_extractor,
+                    get_extractor_func=lambda url, headers, host=None: self.get_extractor(url, headers, host, bypass_warp=bypass_warp),
                     no_bypass=no_bypass,
-                    shorten_url_func=None,
+                    shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
+                    bypass_warp=bypass_warp,
                 )
                 return web.Response(
                     text=rewritten_manifest,
@@ -1518,7 +1616,7 @@ class HLSProxy:
 
                     # Use helper to get proxy-enabled session
                     mpd_session, mpd_proxy = await self._get_proxy_session(
-                        stream_url
+                        stream_url, bypass_warp=bypass_warp
                     )
                     if mpd_proxy:
                         logger.info(
@@ -1653,7 +1751,8 @@ class HLSProxy:
                         },
                     )
 
-            return await self._proxy_stream(request, stream_url, stream_headers)
+            # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore)
+            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp)
 
         except Exception as e:
             # ✅ MIGLIORATO: Distingui tra errori temporanei (sito offline) ed errori critici
@@ -1705,6 +1804,9 @@ class HLSProxy:
             logger.critical(f"❌ Critical error with {extractor_name}: {e}")
             logger.exception(f"Error in proxy request: {str(e)}")
             return web.Response(text=f"Proxy error: {str(e)}", status=500)
+        finally:
+            BYPASS_WARP_CONTEXT.reset(token)
+            SELECTED_PROXY_CONTEXT.reset(proxy_token)
 
     async def handle_extractor_request(self, request):
         """
@@ -1718,6 +1820,10 @@ class HLSProxy:
             logger.warning("⛔ Unauthorized extractor request")
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
+        bypass_warp = request.query.get("warp", "").lower() == "off"
+        token = BYPASS_WARP_CONTEXT.set(bypass_warp)
+        proxy_token = SELECTED_PROXY_CONTEXT.set(None)
+        
         try:
             # Supporta sia 'url' che 'd' come parametro
             url = request.query.get("url") or request.query.get("d")
@@ -1814,15 +1920,28 @@ class HLSProxy:
             extractor_kwargs.pop('d', None)   # Remove to avoid duplicate argument error
             extractor_kwargs['request_headers'] = dict(request.headers)
 
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            logger.debug(f"Extractor Debug: Initial bypass_warp from query: {bypass_warp}")
+            
             extractor = await self.get_extractor(
-                url, dict(request.headers), host=host_param
+                url, dict(request.headers), host=host_param, bypass_warp=bypass_warp
             )
             result = await extractor.extract(url, **extractor_kwargs)
 
             stream_url = result["destination_url"]
             stream_headers = result.get("request_headers", {})
             mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
-
+            force_disable_ssl = result.get("disable_ssl", False)
+            bypass_warp = result.get("bypass_warp", bypass_warp)
+            
+            # Log dello stato dell'estrattore
+            logger.debug(f"Extractor Debug: Extractor result bypass_warp: {result.get('bypass_warp')}")
+            
+            # Non forziamo più l'override qui, lasciamo che sia la scelta iniziale a comandare
+            # bypass_warp = bypass_warp (rimane quello definito all'inizio a riga 1902)
+            
+            logger.debug(f"Extractor Debug: Final bypass_warp for redirect: {bypass_warp}")
+            
             logger.info(
                 f"✅ Extraction success: {stream_url[:50]}... Endpoint: {mediaflow_endpoint}"
             )
@@ -1856,6 +1975,12 @@ class HLSProxy:
             api_password = request.query.get("api_password")
             if api_password:
                 header_params += f"&api_password={api_password}"
+
+            if force_disable_ssl:
+                header_params += "&disable_ssl=1"
+
+            if bypass_warp:
+                header_params += "&warp=off"
 
             # 1. URL COMPLETO (Solo per il redirect)
             full_proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
@@ -1906,6 +2031,9 @@ class HLSProxy:
                 traceback.print_exc()
 
             return web.Response(text=str(e), status=500)
+        finally:
+            BYPASS_WARP_CONTEXT.reset(token)
+            SELECTED_PROXY_CONTEXT.reset(proxy_token)
 
     async def handle_license_request(self, request):
         """✅ NUOVO: Gestisce le richieste di licenza DRM (ClearKey e Proxy)"""
@@ -1978,7 +2106,10 @@ class HLSProxy:
             logger.info(f"🔐 Proxying License Request to: {license_url}")
 
             # ✅ Use pooled session for better performance
-            session, _ = await self._get_proxy_session(license_url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            session, _ = await self._get_proxy_session(
+                license_url, bypass_warp=bypass_warp
+            )
             async with session.request(
                 request.method, license_url, headers=headers, data=body
             ) as resp:
@@ -2009,6 +2140,8 @@ class HLSProxy:
         if not check_password(request):
             return web.Response(status=401, text="Unauthorized: Invalid API Password")
 
+        bypass_warp = request.query.get("warp", "").lower() == "off"
+
         # 1. Gestione chiave statica (da MPD converter)
         static_key = request.query.get("static_key")
         if static_key:
@@ -2036,17 +2169,48 @@ class HLSProxy:
             # Avoid unquoting again or embedded encoded URLs may break.
 
             original_channel_url = request.query.get("original_channel_url")
+            
+            # Detect DLStreams keys by multiple signals:
+            # 1. original_channel_url contains known domains
+            # 2. key_url matches /key/premium pattern (CDN rotates domains)
+            # 3. original_channel_url contains the mono.css manifest pattern
+            is_dlstreams_key = False
             if original_channel_url and any(
-                marker in original_channel_url for marker in ["dlhd.dad", "dlstreams.top"]
+                marker in original_channel_url for marker in ["dlhd.dad", "dlstreams.top", "dlstreams.com"]
             ):
+                is_dlstreams_key = True
+            elif re.search(r"/key/premium\d+/", key_url):
+                is_dlstreams_key = True
+            elif original_channel_url and re.search(r"/proxy/.+/premium\d+/mono\.css", original_channel_url):
+                is_dlstreams_key = True
+
+            if is_dlstreams_key:
+                # First check if the DLStreams extractor already has this key cached
+                dlstreams_extractor = self.extractors.get("dlstreams")
+                if dlstreams_extractor and hasattr(dlstreams_extractor, "_browser_key_cache"):
+                    cached_key = dlstreams_extractor._browser_key_cache.get(key_url)
+                    if cached_key:
+                        logger.info("✅ AES key served from DLStreams browser cache (%d bytes)", len(cached_key))
+                        return web.Response(
+                            body=cached_key,
+                            content_type="application/octet-stream",
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Access-Control-Allow-Headers": "*",
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                            },
+                        )
+
+                # Fallback: try browser-based key fetch
                 try:
-                    extractor = await self.get_extractor(original_channel_url, {})
-                    if hasattr(extractor, "fetch_key_via_browser"):
-                        browser_key = await extractor.fetch_key_via_browser(
-                            key_url, original_channel_url
+                    if dlstreams_extractor and hasattr(dlstreams_extractor, "fetch_key_via_browser"):
+                        # Use original_channel_url or reconstruct from key_url
+                        fetch_url = original_channel_url or key_url
+                        browser_key = await dlstreams_extractor.fetch_key_via_browser(
+                            key_url, fetch_url
                         )
                         if browser_key:
-                            logger.info("✅ AES key fetched via browser context")
+                            logger.info("✅ AES key fetched via browser context (%d bytes)", len(browser_key))
                             return web.Response(
                                 body=browser_key,
                                 content_type="application/octet-stream",
@@ -2056,6 +2220,24 @@ class HLSProxy:
                                     "Cache-Control": "no-cache, no-store, must-revalidate",
                                 },
                             )
+                    elif original_channel_url:
+                        # Try to get extractor via original URL
+                        extractor = await self.get_extractor(original_channel_url, {})
+                        if hasattr(extractor, "fetch_key_via_browser"):
+                            browser_key = await extractor.fetch_key_via_browser(
+                                key_url, original_channel_url
+                            )
+                            if browser_key:
+                                logger.info("✅ AES key fetched via browser context (%d bytes)", len(browser_key))
+                                return web.Response(
+                                    body=browser_key,
+                                    content_type="application/octet-stream",
+                                    headers={
+                                        "Access-Control-Allow-Origin": "*",
+                                        "Access-Control-Allow-Headers": "*",
+                                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                                    },
+                                )
                 except Exception as browser_key_exc:
                     logger.warning(
                         f"⚠️ Browser-backed key fetch failed, falling back to direct request: {browser_key_exc}"
@@ -2083,7 +2265,9 @@ class HLSProxy:
                 proxy_used = None
                 logger.debug("Using direct session for AES key request (forced)")
             else:
-                session, proxy_used = await self._get_proxy_session(key_url)
+                session, proxy_used = await self._get_proxy_session(
+                    key_url, bypass_warp=bypass_warp
+                )
                 if proxy_used:
                     logger.debug(f"Using pooled session with proxy: {proxy_used}")
             secret_key = headers.pop("X-Secret-Key", None)
@@ -2130,6 +2314,14 @@ class HLSProxy:
                     logger.debug(
                         f"✅ AES key fetched successfully: {len(key_data)} bytes"
                     )
+
+                    # Warn if key size is unexpected (AES-128 = 16 bytes)
+                    if len(key_data) != 16 and is_dlstreams_key:
+                        logger.warning(
+                            f"⚠️ DLStreams AES key response is {len(key_data)} bytes (expected 16). "
+                            f"The CDN may have returned an error page instead of the key. "
+                            f"Session cookies may be missing."
+                        )
 
                     return web.Response(
                         body=key_data,
@@ -2206,6 +2398,19 @@ class HLSProxy:
     async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
         """✅ NUOVO: Proxy dedicato per segmenti .ts con Content-Disposition"""
         try:
+            # Ping DLStreams extractor to keep browser alive during playback
+            # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
+            is_dlstreams = any(m in segment_url for m in ["dlhd.dad", "dlstreams", "premium", "mono.css"])
+            if not is_dlstreams:
+                ref = request.query.get("h_Referer", "") or request.headers.get("Referer", "")
+                origin = request.query.get("h_Origin", "") or request.headers.get("Origin", "")
+                is_dlstreams = any(m in (ref + origin).lower() for m in ["dlhd.dad", "dlstreams"])
+            
+            if is_dlstreams:
+                ext = self.extractors.get("dlstreams")
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
+
             headers = dict(stream_headers)
             is_cccdn_stream = "cccdn.net" in segment_url
 
@@ -2224,7 +2429,10 @@ class HLSProxy:
                 headers["Accept-Encoding"] = "identity"
 
             # ✅ Use pooled session for better performance
-            session, _ = await self._get_proxy_session(segment_url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            session, _ = await self._get_proxy_session(
+                segment_url, bypass_warp=bypass_warp
+            )
             # ✅ Use yarl.URL with encoded=True to prevent double-encoding of commas
             final_segment_url = yarl.URL(segment_url, encoded=True)
             async with session.get(final_segment_url, headers=headers) as resp:
@@ -2273,6 +2481,14 @@ class HLSProxy:
                         await response.write(chunk)
                     await response.write_eof()
                     return response
+                except (ClientPayloadError, ConnectionResetError, OSError) as e:
+                    logger.info(
+                        "Segment stream interrupted for %s [%s]: %s",
+                        segment_name,
+                        type(e).__name__,
+                        e,
+                    )
+                    return response
                 except Exception as e:
                     if "Connection lost" not in str(e) and "closing transport" not in str(e):
                         logger.error(f"Error streaming segment {segment_name}: {str(e)}")
@@ -2282,9 +2498,24 @@ class HLSProxy:
             logger.error(f"Error in segment proxy: {str(e)}")
             return web.Response(text=f"Segment error: {str(e)}", status=500)
 
-    async def _proxy_stream(self, request, stream_url, stream_headers):
+    async def _proxy_stream(self, request, stream_url, stream_headers, bypass_warp=None):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
+        if bypass_warp is None:
+            bypass_warp = request.query.get("warp", "").lower() == "off"
         try:
+            # Ping DLStreams extractor to keep browser alive during playback
+            # Use robust markers: Daddy's domains, 'premium' pattern, 'mono.css', or Referer/Origin headers
+            is_dlstreams = any(m in stream_url for m in ["dlhd.dad", "dlstreams", "premium", "mono.css"])
+            if not is_dlstreams:
+                ref = request.query.get("h_Referer", "") or request.headers.get("Referer", "")
+                origin = request.query.get("h_Origin", "") or request.headers.get("Origin", "")
+                is_dlstreams = any(m in (ref + origin).lower() for m in ["dlhd.dad", "dlstreams"])
+
+            if is_dlstreams:
+                ext = self.extractors.get("dlstreams")
+                if ext and hasattr(ext, "_update_shared_activity"):
+                    ext._update_shared_activity()
+
             headers = dict(stream_headers)
 
             def set_response_header(target: dict, name: str, value: str):
@@ -2354,7 +2585,14 @@ class HLSProxy:
             # logger.info(f"   Final Stream Headers: {headers}")
 
             # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
-            disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            disable_ssl = (
+                request.query.get("h_X-EasyProxy-Disable-SSL") == "1"
+                or request.query.get("disable_ssl") == "1"
+                or headers.get("X-EasyProxy-Disable-SSL") == "1"
+                or get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
+            )
+            headers.pop("X-EasyProxy-Disable-SSL", None)
+            headers.pop("x-easyproxy-disable-ssl", None)
             is_cccdn_stream = "cccdn.net" in stream_url
 
             if is_cccdn_stream:
@@ -2378,11 +2616,11 @@ class HLSProxy:
                     f"[Proxy Stream] Using direct session (forced) for: {stream_url}"
                 )
             else:
-                session, session_proxy = await self._get_proxy_session(stream_url)
+                session, session_proxy = await self._get_proxy_session(stream_url, bypass_warp=bypass_warp)
                 
                 # ✅ FIX LOG: Determine correct routing for display
                 if session_proxy:
-                    routing = f"WARP (Cloudflare IP)" if session_proxy == WARP_PROXY_URL else f"PROXY ({session_proxy})"
+                    routing = f"WARP (Cloudflare IP)" if (WARP_PROXY_URL and session_proxy == WARP_PROXY_URL) else f"PROXY ({session_proxy})"
                 else:
                     routing = "BYPASS (Real IP)"
                 
@@ -2391,7 +2629,15 @@ class HLSProxy:
                 )
 
             # --- PROTECTED DOMAINS FALLBACK: curl_cffi ---
-            if HAS_CURL_CFFI and (not is_cccdn_stream) and any(d in stream_url for d in ["cinemacity.cc", "torrentio", "strem.fun"]):
+            use_curl_cffi = HAS_CURL_CFFI and (not is_cccdn_stream) and any(d in stream_url for d in ["cinemacity.cc", "torrentio", "strem.fun"])
+            
+            if use_curl_cffi and any(d in stream_url for d in ["torrentio", "strem.fun"]):
+                # Only use curl_cffi for Torrentio if it's a manifest or explicitly requested
+                is_manifest_req = any(ext in stream_url.lower() for ext in [".m3u8", ".mpd", "manifest"])
+                if not is_manifest_req:
+                    use_curl_cffi = False
+
+            if use_curl_cffi:
                 logger.info(f"🚀 [curl_cffi] Using browser impersonation for: {stream_url}")
                 try:
                     # Use a pooled curl session if available
@@ -2451,7 +2697,6 @@ class HLSProxy:
                     # cccdn.net multi-path URLs MUST have literal commas.
                     final_curl_url = stream_url
                     if "cccdn.net" in final_curl_url:
-                        import urllib.parse
                         final_curl_url = urllib.parse.unquote(final_curl_url)
 
                     # ✅ NUOVO: Se è un manifest, proviamo a usare smart_request come fallback
@@ -2488,7 +2733,10 @@ class HLSProxy:
                         async def __aexit__(self, exc_type, exc_val, exc_tb): pass
 
                     # Se curl_cffi fallisce con 403 su un manifest, proviamo FlareSolverr via smart_request
-                    if curl_resp.status_code == 403 and is_manifest:
+                    if curl_resp.status_code in [502, 503, 504]:
+                        logger.warning(f"⚠️ [curl_cffi] {curl_resp.status_code} error for {final_curl_url[:50]}, falling back to standard aiohttp...")
+                        goto_manifest_processing = False
+                    elif curl_resp.status_code == 403 and is_manifest:
                         logger.warning(f"⚠️ [curl_cffi] 403 on manifest, trying smart_request fallback for {final_curl_url[:50]}...")
                         from utils.smart_request import smart_request
                         sr_result = await smart_request("request.get", final_curl_url, headers=curl_headers)
@@ -2523,15 +2771,36 @@ class HLSProxy:
                 goto_manifest_processing = False
 
             if not goto_manifest_processing:
-                final_url = yarl.URL(stream_url, encoded=True)
-                resp_ctx = session.get(final_url, headers=headers, ssl=not disable_ssl)
+                if is_cccdn_stream:
+                    request_target = urllib.parse.unquote(stream_url)
+                else:
+                    request_target = yarl.URL(stream_url, encoded=True)
+                resp_ctx = session.get(request_target, headers=headers, ssl=not disable_ssl)
 
             async with resp_ctx as resp:
                 content_type = resp.headers.get("content-type", "").lower()
 
                 if resp.status not in [200, 206]:
+                    if is_cccdn_stream and resp.status == 403 and not goto_manifest_processing:
+                        retry_result = await self._retry_cccdn_request(
+                            request_target,
+                            headers,
+                            disable_ssl,
+                        )
+                        if retry_result:
+                            retry_headers = dict(retry_result["headers"])
+                            retry_headers["Access-Control-Allow-Origin"] = "*"
+                            logger.info(
+                                "✅ cccdn retry success via alternate route: %s",
+                                retry_result["proxy"],
+                            )
+                            return web.Response(
+                                body=retry_result["body"],
+                                status=retry_result["status"],
+                                headers=retry_headers,
+                            )
                     error_body = await resp.read()
-                    routing = "WARP" if session_proxy == WARP_PROXY_URL else ("BYPASS" if session_proxy is None else "PROXY")
+                    routing = "WARP" if (session_proxy and WARP_PROXY_URL and session_proxy == WARP_PROXY_URL) else ("BYPASS" if session_proxy is None else "PROXY")
                     logger.warning(f"⚠️ Upstream returned error {resp.status} for {stream_url} [Routing: {routing}]")
                     return web.Response(body=error_body, status=resp.status, headers={"Content-Type": content_type, "Access-Control-Allow-Origin": "*"})
 
@@ -2554,10 +2823,23 @@ class HLSProxy:
                     try:
                         async for chunk in resp.content.iter_any():
                             await response.write(chunk)
+                        await response.write_eof()
+                        return response
+                    except (ClientPayloadError, ConnectionResetError, OSError) as e:
+                        logger.info(
+                            "Stream relay interrupted for %s [%s]: %s",
+                            stream_url,
+                            type(e).__name__,
+                            e,
+                        )
                         return response
                     except Exception as e:
                         if "Connection lost" not in str(e) and "closing transport" not in str(e):
-                            logger.error(f"❌ Stream error: {e}")
+                            logger.error(
+                                "❌ Stream error [%s]: %r",
+                                type(e).__name__,
+                                e,
+                            )
                         return response
 
                 content_bytes = await resp.read()
@@ -2578,6 +2860,11 @@ class HLSProxy:
                     host = request.headers.get("X-Forwarded-Host", request.host)
                     proxy_base = f"{scheme}://{host}"
                     original_url = request.query.get("url") or request.query.get("d", "")
+                    use_short_hls_urls = (
+                        "cinemacity.cc" in (original_url or "").lower()
+                        or request.query.get("host", "").lower() in {"city", "cinemacity"}
+                        or "cccdn.net" in str(resp.url).lower()
+                    )
                     
                     rewritten = await ManifestRewriter.rewrite_manifest_urls(
                         manifest_content=manifest_content,
@@ -2588,11 +2875,11 @@ class HLSProxy:
                         api_password=request.query.get("api_password"),
                         get_extractor_func=self.get_extractor,
                         no_bypass=request.query.get("no_bypass") == "1",
-                        shorten_url_func=None
+                        shorten_url_func=self.shorten_hls_url if use_short_hls_urls else None,
+                        bypass_warp=bypass_warp
                     )
                     return web.Response(text=rewritten, headers={
                         "Content-Type": "application/vnd.apple.mpegurl",
-                        "Content-Disposition": 'attachment; filename="stream.m3u8"',
                         "Access-Control-Allow-Origin": "*",
                         "Cache-Control": "no-cache",
                     })
@@ -2680,7 +2967,6 @@ class HLSProxy:
                                 text=hls_playlist,
                                 headers={
                                     "Content-Type": "application/vnd.apple.mpegurl",
-                                    "Content-Disposition": 'attachment; filename="stream.m3u8"',
                                     "Access-Control-Allow-Origin": "*",
                                     "Cache-Control": "no-cache",
                                 },
@@ -2702,6 +2988,7 @@ class HLSProxy:
                         headers,
                         clearkey_param,
                         api_password,
+                        bypass_warp=bypass_warp,
                     )
 
                     return web.Response(
@@ -2805,7 +3092,11 @@ class HLSProxy:
                 logger.info(f"ℹ️ Stream connection closed by client or server: {stream_url}")
                 return web.Response(text="Connection lost", status=499)
             
-            logger.error(f"❌ Generic error in stream proxy: {err_msg}")
+            logger.error(
+                "❌ Generic error in stream proxy [%s]: %r",
+                type(e).__name__,
+                e,
+            )
             return web.Response(text=f"Stream error: {err_msg}", status=500)
 
     async def handle_playlist_request(self, request):
@@ -3281,7 +3572,9 @@ class HLSProxy:
 
         return web.json_response(spec)
 
-    def _prefetch_next_segments(self, current_url, init_url, key, key_id, headers):
+    def _prefetch_next_segments(
+        self, current_url, init_url, key, key_id, headers, bypass_warp: bool = False
+    ):
         """Identifica i prossimi segmenti e avvia il download in background."""
         try:
             parsed = urllib.parse.urlparse(current_url)
@@ -3316,7 +3609,13 @@ class HLSProxy:
                     self.prefetch_tasks.add(cache_key)
                     asyncio.create_task(
                         self._fetch_and_cache_segment(
-                            next_url, init_url, key, key_id, headers, cache_key
+                            next_url,
+                            init_url,
+                            key,
+                            key_id,
+                            headers,
+                            cache_key,
+                            bypass_warp=bypass_warp,
                         )
                     )
 
@@ -3324,7 +3623,7 @@ class HLSProxy:
             logger.warning(f"⚠️ Prefetch error: {e}")
 
     async def _fetch_and_cache_segment(
-        self, url, init_url, key, key_id, headers, cache_key
+        self, url, init_url, key, key_id, headers, cache_key, bypass_warp: bool = False
     ):
         """Scarica, decripta e mette in cache un segmento in background."""
         try:
@@ -3334,7 +3633,7 @@ class HLSProxy:
             # Ensure dynamic WARP bypass for prefetch
             self._check_dynamic_warp_bypass(url)
             
-            session = await self._get_session(url=url)
+            session, _ = await self._get_proxy_session(url, bypass_warp=bypass_warp)
 
             # Download Init (usa cache se possibile)
             init_content = b""
@@ -3481,7 +3780,10 @@ class HLSProxy:
                     headers[header_name] = param_value
 
             # Get proxy-enabled session for segment fetches
-            segment_session, segment_proxy = await self._get_proxy_session(url)
+            bypass_warp = request.query.get("warp", "").lower() == "off"
+            segment_session, segment_proxy = await self._get_proxy_session(
+                url, bypass_warp=bypass_warp
+            )
             if segment_proxy:
                 logger.info(f"📡 [Decrypt] Using session via proxy: {segment_proxy}")
 
@@ -3590,7 +3892,9 @@ class HLSProxy:
                     del self.segment_cache[k]
 
             # Prefetch next segments in background
-            self._prefetch_next_segments(url, init_url, key, key_id, headers)
+            self._prefetch_next_segments(
+                url, init_url, key, key_id, headers, bypass_warp=bypass_warp
+            )
 
             # Invia Risposta
             return web.Response(
@@ -3660,6 +3964,7 @@ class HLSProxy:
 
                 endpoint = item.get("endpoint", "/proxy/stream")
                 req_headers = item.get("request_headers", {})
+                bypass_warp = item.get("warp") == "off"
 
                 # Costruisci query params
                 encoded_url = urllib.parse.quote(dest_url, safe="")
@@ -3674,6 +3979,10 @@ class HLSProxy:
                 # Aggiungi password se necessaria
                 if API_PASSWORD:
                     params.append(f"api_password={API_PASSWORD}")
+
+                # Aggiungi bypass warp se richiesto
+                if bypass_warp:
+                    params.append("warp=off")
 
                 # Costruisci URL finale
                 query_string = "&".join(params)

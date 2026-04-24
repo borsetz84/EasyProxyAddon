@@ -16,8 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     ffmpeg \
-    xvfb \
-    xauth \
     chromium \
     libnss3 \
     libatk1.0-0 \
@@ -55,6 +53,7 @@ RUN git clone https://github.com/ThePhaseless/Byparr.git /app/byparr_src \
     && cd /app/byparr_src \
     && sed -i 's/requires-python = .*/requires-python = ">=3.11"/' pyproject.toml \
     && pip install --no-cache-dir .
+RUN python -m camoufox fetch
 
 # 5. EasyProxy Setup
 WORKDIR /app
