@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import re
+import random
+import string
 import time
 from urllib.parse import urlparse, urljoin
 
@@ -40,6 +42,45 @@ class DoodStreamExtractor:
     def _get_proxy(self, url: str) -> str | None:
         return get_proxy_for_url(url, TRANSPORT_ROUTES, GLOBAL_PROXIES)
 
+    def _extract_pass_path(self, html: str) -> str | None:
+        patterns = [
+            r"['\"](/pass_md5/[^'\"]+)['\"]",
+            r"\.get\(\s*['\"](/pass_md5/[^'\"]+)['\"]",
+            r"(/pass_md5/[A-Za-z0-9\-._]+/[A-Za-z0-9]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.I)
+            if match:
+                return match.group(1)
+        return None
+
+    def _extract_token(self, html: str, pass_path: str | None = None) -> str | None:
+        if pass_path:
+            tail = pass_path.rstrip("/").split("/")[-1]
+            if re.fullmatch(r"[A-Za-z0-9]{8,}", tail):
+                return tail
+
+        patterns = [
+            r"makePlay\(\)\s*\{.*?\?token=([A-Za-z0-9]+)&expiry=",
+            r"\?token=([A-Za-z0-9]+)&expiry=",
+            r"token=([A-Za-z0-9]+)",
+            r"['\"]?token['\"]?\s*[:=]\s*['\"]([A-Za-z0-9]+)['\"]",
+            r"window\.[a-z0-9_]+\s*=\s*['\"]([A-Za-z0-9]{20,})['\"]",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.I | re.S)
+            if match:
+                return match.group(1)
+        return None
+
+    def _extract_expiry(self, html: str) -> str:
+        expiry_match = re.search(r"expiry[:=]\s*['\"]?(\d{10,})['\"]?", html, re.I)
+        if expiry_match:
+            return expiry_match.group(1)
+        if re.search(r"expiry=.*Date\.now\(\)", html, re.I | re.S):
+            return str(int(time.time() * 1000))
+        return str(int(time.time()))
+
     async def extract(self, url: str, **kwargs):
         """
         Main extraction entry point. 
@@ -76,21 +117,10 @@ class DoodStreamExtractor:
                 
                 # Extract pass_md5 path and token
                 # Broad regex for pass_md5
-                pass_match = re.search(r"['\"](/pass_md5/[^'\"]+)['\"]", html)
-                if not pass_match:
-                    pass_match = re.search(r"(/pass_md5/[A-Za-z0-9-_.]+)", html)
-                
-                # Broad regex for token
-                token_match = re.search(r"token=([^&\s'\"]+)", html)
-                if not token_match:
-                    token_match = re.search(r"['\"]?token['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", html)
-                if not token_match:
-                    # Look for the last string in the script which is often the token
-                    token_match = re.search(r"window\.[a-z0-9_]+\s*=\s*['\"]([^'\"]{20,})['\"]", html)
-                
-                if pass_match and token_match:
-                    pass_path = pass_match.group(1)
-                    token = token_match.group(1)
+                pass_path = self._extract_pass_path(html)
+                token = self._extract_token(html, pass_path)
+
+                if pass_path and token:
                     pass_url = urljoin(embed_url, pass_path)
                     
                     logger.info(f"🔗 Cloudscraper found pass_md5 path: {pass_path}")
@@ -118,22 +148,11 @@ class DoodStreamExtractor:
         if "RELOAD" in base_stream or len(base_stream) < 5:
             raise ExtractorError(f"DoodStream: Captured pass_md5 is invalid ({base_stream[:20]})")
 
-        # Find token and expiry in the captured HTML
-        token_match = re.search(r"token=([^&\s'\"]+)", html)
-        if not token_match:
-            token_match = re.search(r"['\"]?token['\"]?\s*[:=]\s*['\"]([^'\"]+)['\"]", html)
-        if not token_match:
-            token_match = re.search(r"window\.[a-z0-9_]+\s*=\s*['\"]([^'\"]{20,})['\"]", html)
-
-        if not token_match:
+        token = self._extract_token(html)
+        if not token:
              raise ExtractorError("DoodStream: token not found in HTML")
-            
-        token = token_match.group(1)
-        expiry_match = re.search(r"expiry[:=]\s*['\"]?(\d+)['\"]?", html)
-        expiry = expiry_match.group(1) if expiry_match else str(int(time.time()))
-        
-        import random
-        import string
+
+        expiry = self._extract_expiry(html)
         rand_str = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(10))
         final_url = f"{base_stream}{rand_str}?token={token}&expiry={expiry}"
 
