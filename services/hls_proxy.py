@@ -1318,6 +1318,7 @@ class HLSProxy:
         bypass_warp = (request.query.get("warp", "").lower() == "off")
         token = BYPASS_WARP_CONTEXT.set(bypass_warp)
         proxy_token = SELECTED_PROXY_CONTEXT.set(None)
+        selected_proxy = None
         
         try:
             extractor = None
@@ -1400,7 +1401,6 @@ class HLSProxy:
                 
                 # Cattura e sanifica il proxy per evitare double-encoding (%253A -> %3A)
                 raw_proxy = request.query.get("proxy") or result.get("selected_proxy")
-                selected_proxy = None
                 if raw_proxy:
                     selected_proxy = urllib.parse.unquote(raw_proxy)
                     if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
@@ -2288,8 +2288,9 @@ class HLSProxy:
                 proxy_used = None
                 logger.debug("Using direct session for AES key request (forced)")
             else:
+                forced_proxy = request.query.get("proxy") or None
                 session, proxy_used = await self._get_proxy_session(
-                    key_url, bypass_warp=bypass_warp
+                    key_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
                 )
                 if proxy_used:
                     logger.debug(f"Using pooled session with proxy: {proxy_used}")
