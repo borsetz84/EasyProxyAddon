@@ -721,8 +721,25 @@ class VixSrcExtractor:
                 return None
 
             final_url = await _extract_from_html(response.text)
+
+            # fallback: construct playlist URL from embed URL params when HTML has no tokens
+            if not final_url and "/embed/" in parsed_url.path:
+                embed_match = re.search(r"/embed/(?P<video_id>\d+)", url)
+                if embed_match:
+                    query_params = parse_qs(parsed_url.query)
+                    token = query_params.get("token", [None])[0]
+                    expires = query_params.get("expires", [None])[0]
+                    if token and expires:
+                        playlist_path = f"/playlist/{embed_match.group('video_id')}"
+                        playlist_params = {"b": "1", "token": token, "expires": expires, "lang": "it"}
+                        if query_params.get("canPlayFHD", ["0"])[0] == "1":
+                            playlist_params["h"] = "1"
+                        site_url = self._normalize_base_site(url)
+                        final_url = f"{site_url}{playlist_path}?{urlencode(playlist_params)}"
+                        logger.info("VixSrc URL constructed from embed params: %s", final_url)
+
             if not final_url:
-                raise ExtractorError("No playlist data found in response (script or data-page)")
+                raise ExtractorError("No playlist data found in response, and embed URL has no token/expires")
 
             stream_headers = self._fresh_headers(Referer=url)
             logger.info("VixSrc URL extracted successfully: %s", final_url)
