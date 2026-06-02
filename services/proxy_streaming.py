@@ -109,7 +109,7 @@ class HLSProxyStreamingMixin:
                         final_segment_url,
                         headers=headers,
                         ssl=not disable_ssl,
-                        timeout=ClientTimeout(total=6, connect=3, sock_connect=3, sock_read=4),
+                        timeout=ClientTimeout(total=20, connect=5, sock_connect=5, sock_read=15),
                     )
                     resp = await resp_ctx.__aenter__()
                     break
@@ -352,7 +352,7 @@ class HLSProxyStreamingMixin:
                 HAS_CURL_CFFI,
             )
             is_hls_segment_request = request.path.startswith("/proxy/hls/segment.")
-            segment_timeout = ClientTimeout(total=6, connect=3, sock_connect=3, sock_read=4)
+            segment_timeout = ClientTimeout(total=20, connect=5, sock_connect=5, sock_read=15)
 
             if use_curl_cffi:
                 logger.info(f"🚀 [curl_cffi] Using browser impersonation for: {stream_url}")
@@ -597,22 +597,48 @@ class HLSProxyStreamingMixin:
                 for attempt in range(2):
                     await asyncio.sleep(0.15 * (attempt + 1))
                     try:
-                        async with session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as retry_resp:
-                            if retry_resp.status not in [200, 206]:
-                                logger.debug(
-                                    "Segment payload retry got status %s for %s",
-                                    retry_resp.status,
-                                    stream_url,
-                                )
-                                continue
-                            retry_body = await retry_resp.read()
-                            logger.info(
-                                "Recovered interrupted segment with same-proxy retry %d for %s (%s)",
-                                attempt + 1,
-                                stream_url,
-                                type(reason).__name__,
+                        if session_proxy:
+                            connector_url = session_proxy
+                            rdns = True
+                            if connector_url.startswith("socks5h://"):
+                                connector_url = connector_url.replace("socks5h://", "socks5://")
+                                rdns = True
+                            elif connector_url.startswith("socks4a://"):
+                                connector_url = connector_url.replace("socks4a://", "socks4://")
+                                rdns = True
+                            
+                            connector = ProxyConnector.from_url(
+                                connector_url,
+                                limit=1,
+                                family=socket.AF_INET,
+                                rdns=rdns,
+                                force_close=True
                             )
-                            return retry_body, retry_resp.headers, retry_resp.status
+                        else:
+                            connector = TCPConnector(
+                                limit=1,
+                                family=socket.AF_INET,
+                                force_close=True
+                            )
+                        
+                        retry_session = ClientSession(connector=connector)
+                        async with retry_session:
+                            async with retry_session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as retry_resp:
+                                if retry_resp.status not in [200, 206]:
+                                    logger.debug(
+                                        "Segment payload retry got status %s for %s",
+                                        retry_resp.status,
+                                        stream_url,
+                                    )
+                                    continue
+                                retry_body = await retry_resp.read()
+                                logger.info(
+                                    "✅ [Recupero] Segmento ripristinato con connessione proxy pulita (%d/2) per %s (%s)",
+                                    attempt + 1,
+                                    stream_url.split('/')[-1].split('?')[0],
+                                    type(reason).__name__,
+                                )
+                                return retry_body, retry_resp.headers, retry_resp.status
                     except (ClientPayloadError, ConnectionResetError, OSError, asyncio.TimeoutError) as exc:
                         logger.debug(
                             "Segment payload retry %d failed for %s: %r",
