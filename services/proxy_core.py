@@ -403,15 +403,14 @@ class HLSProxyCoreMixin:
             await try_shutdown_idle_flaresolverr()
 
     async def get_warp_status(self) -> str:
-        """Checks WARP on-demand. If ENABLE_WARP=True, verifies through the WARP proxy."""
+        """Returns WARP status. If ENABLE_WARP=True, assumes Connected. Otherwise checks via WARP proxy."""
+        if ENABLE_WARP and WARP_PROXY_URL:
+            return "Connected"
         now = time.monotonic()
         if now - getattr(self, '_warp_check_ts', 0) < 5:
             return getattr(self, '_warp_cached', "Disconnected")
         try:
-            if ENABLE_WARP and WARP_PROXY_URL:
-                connector = ProxyConnector.from_url(WARP_PROXY_URL)
-            else:
-                connector = TCPConnector()
+            connector = ProxyConnector.from_url(WARP_PROXY_URL) if WARP_PROXY_URL else TCPConnector()
             async with ClientSession(connector=connector, timeout=ClientTimeout(total=5)) as session:
                 async with session.get("https://www.cloudflare.com/cdn-cgi/trace") as resp:
                     if resp.status == 200:
