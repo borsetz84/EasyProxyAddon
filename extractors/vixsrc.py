@@ -29,7 +29,7 @@ class ExtractorError(Exception):
 class VixSrcExtractor:
     """VixSrc URL extractor per risolvere link VixSrc."""
     def __init__(self, request_headers: dict, proxies: list = None, bypass_warp: bool = None):
-        self.bypass_warp_active = True  # VixSrc always bypasses WARP by default (warp=off)
+        self.bypass_warp_active = bypass_warp if bypass_warp is not None else False  # Use WARP by default
         self.request_headers = request_headers
         self.base_headers = self._default_headers()
         self.session = None
