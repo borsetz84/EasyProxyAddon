@@ -590,6 +590,12 @@ class HLSProxyManifestHandlerMixin:
                     if ext_param:
                         params += f"&ext={ext_param}"
 
+                    # Propagate warp=off and proxy=off to generated HLS URLs
+                    if bypass_warp:
+                        params += "&warp=off"
+                    if bypass_proxies:
+                        params += "&proxy=off"
+
                     # Check if requesting specific representation
                     rep_id = request.query.get("rep_id")
 
