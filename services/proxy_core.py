@@ -54,6 +54,7 @@ class HLSProxyCoreMixin:
         """Starts background tasks for the proxy."""
         asyncio.create_task(self._update_latest_version())
         asyncio.create_task(self._cleanup_stale_sessions())
+        asyncio.create_task(self._warp_keepalive())
 
     async def _cleanup_stale_sessions(self):
         """Periodic cleanup of stale CDN tokens (extractor cache is disabled —
@@ -72,6 +73,34 @@ class HLSProxyCoreMixin:
                 logger.debug("🧹 Cleaned stale CDN token: %s", k[:8])
 
 
+
+    async def _warp_keepalive(self):
+        """Periodically test WARP tunnel and reconnect if down. Never marks WARP dead."""
+        while True:
+            await asyncio.sleep(30)
+            _ENABLE_WARP = _shared.ENABLE_WARP
+            _WARP_PROXY_URL = _shared.WARP_PROXY_URL
+            if not _ENABLE_WARP or not _WARP_PROXY_URL:
+                continue
+            try:
+                connector = get_connector_for_proxy(
+                    _WARP_PROXY_URL, limit=0, family=socket.AF_INET
+                )
+                timeout = ClientTimeout(total=8)
+                async with ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get("https://api.ipify.org?format=json") as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            self._warp_ip = data.get("ip", "")
+                            continue
+            except Exception:
+                pass
+            logger.warning("WARP tunnel down, reconnecting...")
+            result = await self.reconnect_warp()
+            if result.get("status") == "ok":
+                logger.info("WARP reconnected: %s", result.get("message"))
+            else:
+                logger.error("WARP reconnect failed: %s", result.get("message"))
 
     async def get_warp_status(self) -> str:
         """Returns WARP status and fetches real external IP through WARP proxy."""

@@ -10,7 +10,7 @@ import urllib.request
 from dotenv import load_dotenv
 from config_store import get as _cfg_get, set as _cfg_set, get_all as _cfg_get_all
 
-APP_VERSION = "2.9.50"
+APP_VERSION = "2.9.51"
 
 
 def get_extractor_proxies(extractor_name: str) -> list:
@@ -415,16 +415,10 @@ def is_proxy_alive(proxy_url: str, force_check: bool = False) -> bool:
                 return False
             DEAD_PROXIES.pop(proxy_url, None)
 
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(proxy_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 1080
-        with socket.create_connection((host, port), timeout=5):
-            return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
+    if not _socket_check(proxy_url, timeout=5):
         logging.warning(f"Proxy {proxy_url} is NOT reachable.")
         return False
+    return True
 
 
 async def is_proxy_alive_async(proxy_url: str, force_check: bool = False) -> bool:
@@ -438,13 +432,31 @@ async def is_proxy_alive_async(proxy_url: str, force_check: bool = False) -> boo
             if now < expire_time:
                 return False
             DEAD_PROXIES.pop(proxy_url, None)
+    loop = asyncio.get_event_loop()
     try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _socket_check, proxy_url, 5)
-        return True
+        alive = await loop.run_in_executor(None, _socket_check, proxy_url, 5)
+        if not alive:
+            raise OSError("Proxy check returned false")
     except (socket.timeout, ConnectionRefusedError, OSError):
         logging.warning(f"Proxy {proxy_url} is NOT reachable.")
         return False
+    return True
+
+
+def _socks5_greeting(host: str, port: int, timeout: float = 5) -> bool:
+    """Perform SOCKS5 greeting handshake to verify proxy speaks SOCKS5."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        # greeting: version=5, 1 auth method, no-auth=0
+        sock.sendall(bytes([0x05, 0x01, 0x00]))
+        resp = sock.recv(2)
+        return len(resp) == 2 and resp[0] == 0x05 and resp[1] == 0x00
+    except OSError:
+        return False
+    finally:
+        sock.close()
 
 
 def _socket_check(proxy_url: str, timeout: float = 5) -> bool:
@@ -453,6 +465,9 @@ def _socket_check(proxy_url: str, timeout: float = 5) -> bool:
     parsed = urlparse(proxy_url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 1080
+    scheme = parsed.scheme.lower()
+    if scheme in ("socks5", "socks5h"):
+        return _socks5_greeting(host, port, timeout)
     with socket.create_connection((host, port), timeout=timeout):
         return True
 

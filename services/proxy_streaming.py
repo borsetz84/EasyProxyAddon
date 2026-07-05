@@ -1107,6 +1107,8 @@ class HLSProxyStreamingMixin:
             ServerDisconnectedError,
             ClientConnectionError,
             asyncio.TimeoutError,
+            AioProxyError,
+            PyProxyError,
         ) as e:
             # Errori di connessione upstream
             active_proxy = session_proxy or forced_proxy
@@ -1119,6 +1121,10 @@ class HLSProxyStreamingMixin:
                     active_proxy,
                     extractor_key=request.query.get("extractor_key"),
                 )
+            # Reactive WARP reconnect: if WARP failed mid-stream, reconnect immediately
+            if active_proxy and getattr(_shared, 'WARP_PROXY_URL', None) and active_proxy == _shared.WARP_PROXY_URL:
+                logger.warning("WARP stream failure, triggering immediate reconnect...")
+                asyncio.create_task(self.reconnect_warp())
             logger.warning(f"⚠️ Connection lost with source: {stream_url} ({str(e)})")
             return web.Response(text=f"Upstream connection lost: {str(e)}", status=502)
 
